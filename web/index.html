@@ -1,30 +1,57 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>cadquery2web</title>
+  <title>LLMCAD</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="stylesheet" href="main.css">
+  <link rel="stylesheet" href="css/chat.css">
   <link rel="icon" type="image/png" sizes="192x192" href="favicon/favicon-192x192.png">
   <link rel="icon" type="image/x-icon" href="favicon/favicon.ico">
 </head>
 <body>
   <div class="container">
-    <div class="left-panel">
-      <h1><a href="http://github.com/30hours/cadquery2web">cadquery2web</a></h1>
+
+    <aside class="panel chat-panel" id="chat-panel">
+      <header class="panel-header">
+        <h2>Chat LLM</h2>
+        <button class="new-chat-btn" id="new-chat-btn" title="Vide l'historique, l'éditeur et le viewer">+ Nouveau chat</button>
+      </header>
+      <div class="chat-thread" id="chat-thread"></div>
+      <div class="chat-input-area">
+        <textarea id="chat-input" rows="3" placeholder="Décrivez la pièce à générer (Ctrl+Enter pour envoyer)..."></textarea>
+        <button class="send-btn" id="chat-send">Envoyer</button>
+      </div>
+    </aside>
+
+    <div class="resizer" id="resizer-1" title="Glisser pour redimensionner"></div>
+
+    <section class="panel editor-panel" id="editor-panel">
+      <header class="panel-header">
+        <h1><a href="http://github.com/30hours/cadquery2web">cadquery2web</a></h1>
+      </header>
       <textarea id="code-input" spellcheck="false" placeholder="Enter CadQuery code here..."></textarea>
       <div class="buttons-container">
-        <button class="render-btn" id="preview-btn">Preview</button>
-        <button class="render-btn" id="stl-btn">STL</button>
-        <button class="render-btn" id="step-btn">STEP</button>
+        <button class="render-btn" id="preview-btn">Run / Preview</button>
       </div>
       <div class="output-container" id="output-container">
         <div class="output-title">Output:</div>
         <pre id="output-message"></pre>
       </div>
-    </div>
-      <div class="right-panel" id="viewer"></div>
+    </section>
+
+    <div class="resizer" id="resizer-2" title="Glisser pour redimensionner"></div>
+
+    <section class="panel viewer-panel" id="viewer-panel">
+      <div class="viewer-container right-panel" id="viewer"></div>
+      <div class="export-buttons">
+        <button class="render-btn" id="stl-btn">Export STL</button>
+        <button class="render-btn" id="step-btn">Export STEP</button>
+      </div>
+    </section>
+
   </div>
-    <script type="module" src="models.js"></script>
-    <script type="module" src="main.js"></script>
+  <script type="module" src="models.js"></script>
+  <script type="module" src="main.js"></script>
+  <script type="module" src="js/chat.js"></script>
 </body>
 </html>

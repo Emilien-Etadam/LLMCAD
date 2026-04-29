@@ -1,0 +1,5 @@
+cadquery
+numpy
+flask
+gunicorn
+python-dotenv
