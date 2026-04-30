@@ -2,39 +2,25 @@
 @file server.py
 @brief Flask front-end for the Build123d sandbox (bare-metal adaptation).
 
-@author 30hours
-
-Phase 4.5 — process isolation:
-    Each /preview, /stl, /step request is executed by a fresh `worker.py`
-    subprocess instead of an in-process thread. This means:
-      * Wall-clock timeouts are enforced via subprocess.kill, including for
-        runaway native (OpenCascade) code that previously kept a Python
-        thread alive forever.
-      * A segfault inside libTKBO/libTKMath/etc. only kills the worker;
-        Flask stays up and the next request goes through.
-      * RLIMIT_AS lives inside worker.py (default 2 GiB; configurable via
-        CADQUERY_WORKER_MEM_LIMIT_MB) and only caps the user script, not
-        the long-lived Flask process which legitimately reserves >1 GiB
-        at idle.
-
-Phase 5 — validator removed:
-    The previous AST-level validator was removed: subprocess + RLIMIT_AS
-    is now the only line of defense. This makes the surface area small
-    enough to audit and stops fighting the validator's whitelist every
-    time a new build123d construct is needed. Local-only deployment is
-    assumed; do NOT expose this server to the public internet without
-    re-introducing input validation.
+Phase 6 — pool de workers persistants :
+    Un pool de processus `worker.py --persistent` évite de réimporter
+    build123d (~2–4 s) à chaque requête. Isolation subprocess + RLIMIT_AS
+    inchangées (par worker). Timeout : WORKER_REQUEST_TIMEOUT (fallback
+    CADQUERY_EXEC_TIMEOUT).
 """
 
+from __future__ import annotations
+
+import atexit
 import io
 import json
 import os
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
-from flask import Flask, request, send_file
+from flask import Flask, jsonify, request, send_file
+
+from pool import WorkerPool
 
 try:
     from dotenv import load_dotenv
@@ -48,98 +34,28 @@ except ImportError:
 
 app = Flask(__name__)
 
-# --- Paths / config ----------------------------------------------------------
+# --- Pool --------------------------------------------------------------------
 
-_HERE = Path(__file__).resolve().parent
-_WORKER = _HERE / "worker.py"
-_PYTHON = sys.executable
+_POOL_SIZE = int(os.environ.get("WORKER_POOL_SIZE", "2"))
+_WORKER_MEM_MB = int(os.environ.get("CADQUERY_WORKER_MEM_LIMIT_MB", "4096"))
+_REQUEST_TIMEOUT = float(
+    os.environ.get(
+        "WORKER_REQUEST_TIMEOUT",
+        os.environ.get("CADQUERY_EXEC_TIMEOUT", "30"),
+    )
+)
 
-EXEC_TIMEOUT_SEC = float(os.environ.get("CADQUERY_EXEC_TIMEOUT", "30"))
+pool = WorkerPool(size=_POOL_SIZE, mem_limit_mb=_WORKER_MEM_MB)
+pool.start()
+atexit.register(pool.shutdown)
 
 
-# --- Subprocess driver -------------------------------------------------------
-
-
-def _run_worker(code: str, mode: str, output_suffix: str):
-    """
-    @brief Run a user script in an isolated subprocess.
-    @param code Raw user code (executed verbatim by the worker).
-    @param mode One of 'preview', 'stl', 'step'.
-    @param output_suffix Extension for the worker's output file
-                         ('.json', '.stl', '.step').
-    @return (output_path, error)
-            output_path: path to the worker's output file (caller is
-                         responsible for cleanup) or None on error.
-            error:       error message string or None on success.
-
-    Lifecycle:
-        1. Write the user code to a temp file.
-        2. Spawn `python worker.py <code> <output> <mode>` with timeout.
-        3. On timeout: kill, cleanup, return ("Execution timeout exceeded …").
-        4. On non-zero exit: return (None, stderr-summary).
-        5. On success: return (output_path, None).
-    """
-    code_fd, code_path = tempfile.mkstemp(suffix=".py", prefix="cqcode_")
-    out_fd, output_path = tempfile.mkstemp(suffix=output_suffix, prefix="cqout_")
-    os.close(out_fd)
-    try:
-        with os.fdopen(code_fd, "w", encoding="utf-8") as fh:
-            fh.write(code)
-    except Exception:
-        try:
-            os.unlink(code_path)
-        except OSError:
-            pass
-        try:
-            os.unlink(output_path)
-        except OSError:
-            pass
-        raise
-
-    proc = None
-    try:
-        proc = subprocess.Popen(
-            [_PYTHON, str(_WORKER), code_path, output_path, mode],
-            cwd=str(_HERE),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=EXEC_TIMEOUT_SEC)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            try:
-                proc.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-            return None, (
-                f"Execution timeout exceeded ({EXEC_TIMEOUT_SEC:g}s). "
-                "Possible infinite loop or runaway computation."
-            )
-
-        if proc.returncode != 0:
-            err = (stderr or "").strip()
-            if not err:
-                signal_hint = ""
-                if proc.returncode is not None and proc.returncode < 0:
-                    signal_hint = f" (signal {-proc.returncode})"
-                err = f"Worker exited with code {proc.returncode}{signal_hint}"
-            return None, err
-
-        return output_path, None
-    finally:
-        try:
-            os.unlink(code_path)
-        except OSError:
-            pass
-        # NOTE: output_path cleanup is the caller's job on success;
-        # on failure we wipe it here to avoid leaking temp files.
-        if proc is None or proc.returncode != 0:
-            try:
-                os.unlink(output_path)
-            except OSError:
-                pass
+def _worker_error_message(resp: dict) -> str:
+    msg = str(resp.get("error") or "Unknown worker error")
+    tb = (resp.get("traceback") or "").strip()
+    if tb:
+        return msg + "\n" + tb
+    return msg
 
 
 def make_response(data=None, message="Success", status=200):
@@ -158,46 +74,42 @@ def health():
     """
     @brief Liveness probe used by start.sh's watchdog.
 
-    Returns 200 'ok' as long as the Flask app is reachable. We deliberately
-    do NOT spawn a worker here so that the watchdog can ping cheaply every
-    30 s without warming up a build123d import.
+    Répond en JSON léger (pas d'exécution utilisateur). Phase 6 : état du pool.
     """
-    return ("ok", 200, {"Content-Type": "text/plain"})
+    return jsonify(
+        {
+            "status": "ok",
+            "workers_alive": pool.workers_alive(),
+            "workers_total": pool.workers_total(),
+        }
+    )
 
 
 @app.route("/preview", methods=["POST"])
 def run_preview():
-    output_path = None
     try:
         code = request.json["code"]
-        output_path, error = _run_worker(code, "preview", ".json")
-        if error:
-            return make_response(message=error, status=400)
-        with open(output_path, "r", encoding="utf-8") as fh:
-            mesh_data = json.load(fh)
+        resp = pool.execute("preview", code, timeout=_REQUEST_TIMEOUT)
+        if not resp.get("ok"):
+            return make_response(message=_worker_error_message(resp), status=400)
+        mesh_data = {
+            "vertices": resp["vertices"],
+            "faces": resp["faces"],
+            "objectCount": resp["objectCount"],
+        }
         return make_response(data=mesh_data, message="Preview generated successfully")
     except Exception as e:
         return make_response(message=str(e), status=500)
-    finally:
-        if output_path:
-            try:
-                os.unlink(output_path)
-            except OSError:
-                pass
 
 
-def _send_export(code: str, mode: str, suffix: str, download_name: str):
-    """Common /stl + /step handler: run worker, stream the file from memory.
-
-    Why memory rather than `send_file(path)` + call_on_close: Flask's dev
-    server (Werkzeug) does not always fire call_on_close (e.g. when the
-    client disconnects, or with some forwarding setups), leaking temp
-    files in /tmp. STL/STEP outputs for our use case are small (<10 MB),
-    so we slurp them and unlink immediately.
-    """
-    output_path, error = _run_worker(code, mode, suffix)
-    if error:
-        return make_response(message=error, status=400)
+def _send_export(code: str, mode: str, download_name: str):
+    """Common /stl + /step handler: run worker pool, stream from memory."""
+    resp = pool.execute(mode, code, timeout=_REQUEST_TIMEOUT)
+    if not resp.get("ok"):
+        return make_response(message=_worker_error_message(resp), status=400)
+    output_path = resp.get("path")
+    if not output_path or not isinstance(output_path, str):
+        return make_response(message="Worker did not return output path", status=400)
     try:
         with open(output_path, "rb") as fh:
             payload = fh.read()
@@ -218,7 +130,7 @@ def _send_export(code: str, mode: str, suffix: str, download_name: str):
 def run_stl():
     try:
         code = request.json["code"]
-        return _send_export(code, "stl", ".stl", "model.stl")
+        return _send_export(code, "stl", "model.stl")
     except Exception as e:
         return make_response(message=str(e), status=500)
 
@@ -227,7 +139,7 @@ def run_stl():
 def run_step():
     try:
         code = request.json["code"]
-        return _send_export(code, "step", ".step", "model.step")
+        return _send_export(code, "step", "model.step")
     except Exception as e:
         return make_response(message=str(e), status=500)
 
@@ -237,7 +149,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("CADQUERY_PORT", "5002"))
     print(f"Build123d server starting on http://{host}:{port}")
     print(
-        f"[server] subprocess sandbox: exec_timeout={EXEC_TIMEOUT_SEC:g}s, "
-        f"worker={_WORKER.name}"
+        f"[server] worker pool: size={_POOL_SIZE}, "
+        f"request_timeout={_REQUEST_TIMEOUT:g}s, mem_limit_mb={_WORKER_MEM_MB}"
     )
-    app.run(host=host, port=port)
+    app.run(host=host, port=port, threaded=True)
