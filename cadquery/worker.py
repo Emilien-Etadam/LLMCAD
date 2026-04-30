@@ -39,13 +39,15 @@ import traceback
 from typing import Any, List
 
 # RLIMIT_AS must be set BEFORE importing the heavy stack (build123d / OCP).
-# build123d 0.10 + cadquery-ocp 7.9 + numpy reserve roughly 1.3 GiB of
-# virtual address space at idle, so a too-tight cap segfaults the worker
-# at import time. Default to 2 GiB (idle ~1.3 GiB + headroom for the user
-# script). Operators can tighten / loosen via env var:
-#     CADQUERY_WORKER_MEM_LIMIT_MB=512   # tighter (will likely crash)
-#     CADQUERY_WORKER_MEM_LIMIT_MB=0     # disabled
-_MEM_LIMIT_MB = int(os.environ.get("CADQUERY_WORKER_MEM_LIMIT_MB", "2048"))
+# build123d 0.10 + cadquery-ocp 7.9 + numpy reserve roughly 1.7 GiB of
+# virtual address space at idle, and a non-trivial fillet / tessellate
+# can spike to ~2.5 GiB. The phase-4.5 default of 2 GiB segfaults the
+# worker mid-fillet, so we default to 4 GiB (idle ~1.7 GiB + headroom
+# for the user script and OCP scratch buffers). Operators can tighten
+# or loosen via env var:
+#     CADQUERY_WORKER_MEM_LIMIT_MB=2048   # tighter (will crash on fillet)
+#     CADQUERY_WORKER_MEM_LIMIT_MB=0      # disabled
+_MEM_LIMIT_MB = int(os.environ.get("CADQUERY_WORKER_MEM_LIMIT_MB", "4096"))
 
 
 def _apply_memory_limit() -> None:

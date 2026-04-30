@@ -1,24 +1,29 @@
 """
 @file server.py
-@brief Flask front-end for the CadQuery sandbox (bare-metal adaptation).
+@brief Flask front-end for the Build123d sandbox (bare-metal adaptation).
 
 @author 30hours
 
 Phase 4.5 — process isolation:
-    Each /preview, /stl, /step request is now executed by a fresh
-    `worker.py` subprocess instead of an in-process thread. This means:
+    Each /preview, /stl, /step request is executed by a fresh `worker.py`
+    subprocess instead of an in-process thread. This means:
       * Wall-clock timeouts are enforced via subprocess.kill, including for
         runaway native (OpenCascade) code that previously kept a Python
         thread alive forever.
       * A segfault inside libTKBO/libTKMath/etc. only kills the worker;
         Flask stays up and the next request goes through.
-      * `RLIMIT_AS` can finally be applied — it lives inside worker.py
-        (default 2 GiB; configurable via CADQUERY_WORKER_MEM_LIMIT_MB) and
-        only caps the user script, not the long-lived Flask process which
-        legitimately reserves >1 GiB at idle.
+      * RLIMIT_AS lives inside worker.py (default 2 GiB; configurable via
+        CADQUERY_WORKER_MEM_LIMIT_MB) and only caps the user script, not
+        the long-lived Flask process which legitimately reserves >1 GiB
+        at idle.
 
-The validator (CadQueryValidator) still runs in-process; we only spawn a
-subprocess once the script is known to be syntactically and statically OK.
+Phase 5 — validator removed:
+    The previous AST-level validator was removed: subprocess + RLIMIT_AS
+    is now the only line of defense. This makes the surface area small
+    enough to audit and stops fighting the validator's whitelist every
+    time a new build123d construct is needed. Local-only deployment is
+    assumed; do NOT expose this server to the public internet without
+    re-introducing input validation.
 """
 
 import io
@@ -31,8 +36,6 @@ from pathlib import Path
 
 from flask import Flask, request, send_file
 
-from CadQueryValidator import CadQueryValidator
-
 try:
     from dotenv import load_dotenv
 
@@ -44,7 +47,6 @@ except ImportError:
 
 
 app = Flask(__name__)
-validator = CadQueryValidator()
 
 # --- Paths / config ----------------------------------------------------------
 
@@ -60,8 +62,8 @@ EXEC_TIMEOUT_SEC = float(os.environ.get("CADQUERY_EXEC_TIMEOUT", "30"))
 
 def _run_worker(code: str, mode: str, output_suffix: str):
     """
-    @brief Validate + run a user script in an isolated subprocess.
-    @param code Raw user code.
+    @brief Run a user script in an isolated subprocess.
+    @param code Raw user code (executed verbatim by the worker).
     @param mode One of 'preview', 'stl', 'step'.
     @param output_suffix Extension for the worker's output file
                          ('.json', '.stl', '.step').
@@ -71,23 +73,18 @@ def _run_worker(code: str, mode: str, output_suffix: str):
             error:       error message string or None on success.
 
     Lifecycle:
-        1. Run the static validator. Reject (None, message) on failure.
-        2. Write the cleaned code to a temp file.
-        3. Spawn `python worker.py <code> <output> <mode>` with timeout.
-        4. On timeout: kill, cleanup, return ("Execution timeout exceeded …").
-        5. On non-zero exit: return (None, stderr-summary).
-        6. On success: return (output_path, None).
+        1. Write the user code to a temp file.
+        2. Spawn `python worker.py <code> <output> <mode>` with timeout.
+        3. On timeout: kill, cleanup, return ("Execution timeout exceeded …").
+        4. On non-zero exit: return (None, stderr-summary).
+        5. On success: return (output_path, None).
     """
-    cleaned_code, error = validator.validate(code)
-    if error:
-        return None, error
-
     code_fd, code_path = tempfile.mkstemp(suffix=".py", prefix="cqcode_")
     out_fd, output_path = tempfile.mkstemp(suffix=output_suffix, prefix="cqout_")
     os.close(out_fd)
     try:
         with os.fdopen(code_fd, "w", encoding="utf-8") as fh:
-            fh.write(cleaned_code)
+            fh.write(code)
     except Exception:
         try:
             os.unlink(code_path)
@@ -163,7 +160,7 @@ def health():
 
     Returns 200 'ok' as long as the Flask app is reachable. We deliberately
     do NOT spawn a worker here so that the watchdog can ping cheaply every
-    30 s without warming up a CadQuery import.
+    30 s without warming up a build123d import.
     """
     return ("ok", 200, {"Content-Type": "text/plain"})
 
@@ -238,7 +235,7 @@ def run_step():
 if __name__ == "__main__":
     host = os.environ.get("CADQUERY_HOST", "127.0.0.1")
     port = int(os.environ.get("CADQUERY_PORT", "5002"))
-    print(f"CadQuery server starting on http://{host}:{port}")
+    print(f"Build123d server starting on http://{host}:{port}")
     print(
         f"[server] subprocess sandbox: exec_timeout={EXEC_TIMEOUT_SEC:g}s, "
         f"worker={_WORKER.name}"
