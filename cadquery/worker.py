@@ -1,52 +1,38 @@
 """
 @file worker.py
-@brief Subprocess worker that executes a single user Build123d script.
+@brief Subprocess worker that executes Build123d user scripts.
 
 @usage
+    # One-shot (legacy / tests) — supprimé du serveur après phase 6.
     python worker.py <code_file> <output_file> <mode>
+      mode in: preview | stl | step
 
-      <code_file>   Path to the user script.
-      <output_file> Where to write the result:
-                      mode=preview -> JSON ({vertices, faces, objectCount})
-                      mode=stl     -> binary STL
-                      mode=step    -> ASCII STEP
-      <mode>        One of: preview | stl | step.
+    # Pool persistant (stdin/stdout JSON une ligne par requête)
+    python worker.py --persistent
 
-@exit codes
-    0 - success, output file is valid.
-    1 - runtime error (Build123d / OCC failure, missing `result`, etc.).
-    2 - validation / argument error (bad mode, unreadable code file, ...).
+@persistent protocol
+    Ligne requête: {"op":"preview"|"stl"|"step","code":"..."}
+    Ligne réponse succès preview: {"ok":true,"vertices":[...],"faces":[...],"objectCount":N}
+    Ligne réponse succès stl/step: {"ok":true,"path":"/tmp/cqout_xxx.stl"}
+    Ligne réponse erreur: {"ok":false,"error":"...","traceback":"..."}
 
 @notes
-    Phase 5 (Build123d migration):
-      - The previous AST-level validator (CadQueryValidator) is gone. The
-        only sandboxing left is process isolation + RLIMIT_AS. Local-only
-        deployment is assumed; do NOT expose this server to the public
-        internet without re-introducing a validator.
-      - The user script is `exec()`d in a fresh namespace prepopulated with
-        `from build123d import *`. The script must assign its 3D result to
-        a variable named `result`.
-      - Segfaults / runaway memory in OpenCascade tear down only this
-        worker; the parent Flask server stays alive and the next request
-        spawns a fresh subprocess.
+    RLIMIT_AS avant import build123d. Import build123d une seule fois ;
+    chaque requête utilise exec(code, fresh_globals) avec fresh_globals
+    = copie du template `from build123d import *`.
 """
+
+from __future__ import annotations
 
 import json
 import os
 import resource
 import sys
+import tempfile
 import traceback
-from typing import Any, List
+from typing import Any, Dict
 
 # RLIMIT_AS must be set BEFORE importing the heavy stack (build123d / OCP).
-# build123d 0.10 + cadquery-ocp 7.9 + numpy reserve roughly 1.7 GiB of
-# virtual address space at idle, and a non-trivial fillet / tessellate
-# can spike to ~2.5 GiB. The phase-4.5 default of 2 GiB segfaults the
-# worker mid-fillet, so we default to 4 GiB (idle ~1.7 GiB + headroom
-# for the user script and OCP scratch buffers). Operators can tighten
-# or loosen via env var:
-#     CADQUERY_WORKER_MEM_LIMIT_MB=2048   # tighter (will crash on fillet)
-#     CADQUERY_WORKER_MEM_LIMIT_MB=0      # disabled
 _MEM_LIMIT_MB = int(os.environ.get("CADQUERY_WORKER_MEM_LIMIT_MB", "4096"))
 
 
@@ -69,29 +55,25 @@ def _apply_memory_limit() -> None:
 
 _apply_memory_limit()
 
+import build123d as _b3d  # noqa: E402
 
-import build123d as _b3d  # noqa: E402 - intentionally below RLIMIT_AS application
+from Preview import compute_preview  # noqa: E402
 
 EXIT_OK = 0
 EXIT_RUNTIME = 1
 EXIT_VALIDATION = 2
 
+# Template namespace: filled once after imports (symbols from build123d *).
+_NS_TEMPLATE: Dict[str, Any] = {}
+exec("from build123d import *", _NS_TEMPLATE)  # noqa: S102
 
-def _extract_solids(result: Any) -> List[_b3d.Solid]:
-    """Normalize a user `result` into a flat list of Solids.
 
-    Order of isinstance checks matters: Sketch / Curve / Part all inherit
-    from Compound, so the 2D guards must run first.
-    """
-    if isinstance(result, (_b3d.Sketch, _b3d.Curve)):
-        raise RuntimeError(
-            "le résultat doit être 3D, pas une esquisse/courbe"
-        )
-    if isinstance(result, (_b3d.Part, _b3d.Compound)):
-        return list(result.solids())
-    if isinstance(result, _b3d.Solid):
-        return [result]
-    raise RuntimeError(f"type non supporté: {type(result).__name__}")
+def _fresh_globals() -> Dict[str, Any]:
+    """Nouveau dict par requête — pas de fuite de variables utilisateur."""
+    g = dict(_NS_TEMPLATE)
+    g["__name__"] = "__user_script__"
+    g["b3d"] = _b3d
+    return g
 
 
 def _to_compound(result: Any) -> _b3d.Compound:
@@ -103,45 +85,146 @@ def _to_compound(result: Any) -> _b3d.Compound:
     raise RuntimeError(f"type non supporté pour export: {type(result).__name__}")
 
 
-def _do_preview(result: Any, output_path: str) -> int:
-    solids = _extract_solids(result)
-    if not solids:
-        raise RuntimeError("aucun solide trouvé dans le résultat")
-    all_vertices: List[float] = []
-    all_faces: List[List[int]] = []
-    vertex_offset = 0
-    for solid in solids:
-        verts, tris = solid.tessellate(tolerance=0.1, angular_tolerance=0.1)
-        for v in verts:
-            all_vertices.extend([v.X, v.Y, v.Z])
-        for tri in tris:
-            all_faces.append([tri[0] + vertex_offset, tri[1] + vertex_offset, tri[2] + vertex_offset])
-        vertex_offset += len(verts)
-    payload = {
-        "vertices": all_vertices,
-        "faces": all_faces,
-        "objectCount": len(solids),
-    }
+def _do_stl(result: Any, output_path: str) -> None:
+    compound = _to_compound(result)
+    _b3d.export_stl(compound, output_path, tolerance=0.01, angular_tolerance=0.1)
+
+
+def _do_step(result: Any, output_path: str) -> None:
+    compound = _to_compound(result)
+    _b3d.export_step(compound, output_path)
+
+
+def _do_preview_file(result: Any, output_path: str) -> int:
+    payload = compute_preview(result)
     with open(output_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
     return EXIT_OK
 
 
-def _do_stl(result: Any, output_path: str) -> int:
-    compound = _to_compound(result)
-    _b3d.export_stl(compound, output_path, tolerance=0.01, angular_tolerance=0.1)
-    return EXIT_OK
+def _execute_user_code(code: str) -> tuple[Any | None, Dict[str, Any] | None]:
+    """
+    Exécute `code` dans un namespace frais. Retourne (result, err_response).
+    err_response est non None si échec (dict JSON worker).
+    """
+    namespace = _fresh_globals()
+    try:
+        exec(code, namespace)  # noqa: S102
+    except BaseException as exc:  # noqa: BLE001
+        return None, {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+        }
+    if "result" not in namespace:
+        return None, {
+            "ok": False,
+            "error": "Code did not assign a value to 'result'",
+            "traceback": "",
+        }
+    return namespace["result"], None
 
 
-def _do_step(result: Any, output_path: str) -> int:
-    compound = _to_compound(result)
-    _b3d.export_step(compound, output_path)
-    return EXIT_OK
+def _process_json_request(req: Dict[str, Any]) -> Dict[str, Any]:
+    op = req.get("op")
+    code = req.get("code")
+    if op not in {"preview", "stl", "step"} or not isinstance(code, str):
+        return {
+            "ok": False,
+            "error": "Invalid request: need op in preview|stl|step and code string",
+            "traceback": "",
+        }
+
+    result, err = _execute_user_code(code)
+    if err is not None:
+        return err
+
+    try:
+        if op == "preview":
+            payload = compute_preview(result)
+            out: Dict[str, Any] = {"ok": True}
+            out.update(payload)
+            return out
+        if op == "stl":
+            fd, path = tempfile.mkstemp(suffix=".stl", prefix="cqout_")
+            os.close(fd)
+            try:
+                _do_stl(result, path)
+            except BaseException:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                raise
+            return {"ok": True, "path": path}
+        if op == "step":
+            fd, path = tempfile.mkstemp(suffix=".step", prefix="cqout_")
+            os.close(fd)
+            try:
+                _do_step(result, path)
+            except BaseException:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                raise
+            return {"ok": True, "path": path}
+    except BaseException as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+        }
+
+    return {"ok": False, "error": "unreachable", "traceback": ""}
 
 
-def main() -> int:
+def _write_json_line(obj: Dict[str, Any]) -> None:
+    line = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+def run_persistent() -> None:
+    """Boucle stdin → stdout jusqu'à EOF."""
+    try:
+        for raw in sys.stdin:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                req = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                _write_json_line(
+                    {
+                        "ok": False,
+                        "error": f"Invalid JSON: {exc}",
+                        "traceback": "",
+                    }
+                )
+                continue
+            if not isinstance(req, dict):
+                _write_json_line(
+                    {
+                        "ok": False,
+                        "error": "Request must be a JSON object",
+                        "traceback": "",
+                    }
+                )
+                continue
+            resp = _process_json_request(req)
+            _write_json_line(resp)
+    except BrokenPipeError:
+        pass
+
+
+def main_argv() -> int:
+    """Mode fichier : python worker.py <code_file> <output_file> <mode>"""
     if len(sys.argv) != 4:
-        sys.stderr.write("Usage: worker.py <code_file> <output_file> <mode>\n")
+        sys.stderr.write(
+            "Usage: worker.py <code_file> <output_file> <mode>\n"
+            "   or: worker.py --persistent\n"
+        )
         return EXIT_VALIDATION
 
     code_path = sys.argv[1]
@@ -159,32 +242,23 @@ def main() -> int:
         sys.stderr.write(f"Could not read code file '{code_path}': {exc}\n")
         return EXIT_VALIDATION
 
-    # Prepopulate the namespace with `from build123d import *` so user code
-    # need not (and typically does not) repeat the import. We also expose
-    # `b3d` for explicit access if desired.
-    namespace: dict = {"__name__": "__user_script__", "b3d": _b3d}
-    exec("from build123d import *", namespace)
-
-    try:
-        exec(code, namespace)
-    except BaseException as exc:  # noqa: BLE001 - surface any user-code failure
-        sys.stderr.write(f"{type(exc).__name__}: {exc}\n")
-        traceback.print_exc(file=sys.stderr)
+    result, err = _execute_user_code(code)
+    if err is not None:
+        sys.stderr.write(err["error"] + "\n")
+        if err.get("traceback"):
+            sys.stderr.write(err["traceback"])
         return EXIT_RUNTIME
-
-    if "result" not in namespace:
-        sys.stderr.write("Code did not assign a value to 'result'\n")
-        return EXIT_RUNTIME
-    result = namespace["result"]
 
     try:
         if mode == "preview":
-            return _do_preview(result, output_path)
+            return _do_preview_file(result, output_path)
         if mode == "stl":
-            return _do_stl(result, output_path)
+            _do_stl(result, output_path)
+            return EXIT_OK
         if mode == "step":
-            return _do_step(result, output_path)
-    except BaseException as exc:  # noqa: BLE001 - export/tessellate failures
+            _do_step(result, output_path)
+            return EXIT_OK
+    except BaseException as exc:  # noqa: BLE001
         sys.stderr.write(f"{type(exc).__name__}: {exc}\n")
         traceback.print_exc(file=sys.stderr)
         return EXIT_RUNTIME
@@ -192,5 +266,12 @@ def main() -> int:
     return EXIT_RUNTIME
 
 
+def main() -> None:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--persistent":
+        run_persistent()
+    else:
+        sys.exit(main_argv())
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
