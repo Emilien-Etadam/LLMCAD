@@ -1,12 +1,67 @@
 # STATUS
 
 Index :
-- [Phase 5 — Migration Build123d](#phase-5--migration-cadquery--build123d) ← le plus récent
+- [Phase 6 — Worker pool persistant](#phase-6--worker-pool-persistant) ← le plus récent
+- [Phase 5 — Migration Build123d](#phase-5--migration-cadquery--build123d)
 - Phase 4.5 — Isolation subprocess + Assembly support
 - Phase 4 — System prompt Qwen3 32B
 - Phase 3.5 — Sandbox extension (functions/loops/comprehensions)
 - Phase 2 — Génération CadQuery par LLM (vLLM)
 - Phase 1 — Migration Docker → Bare metal
+
+---
+
+# Phase 6 — Worker pool persistant
+
+Date : 2026-04-30  
+Tag : `v0.6.0-worker-pool`
+
+## Résumé
+
+Remplacement du **lancement `subprocess.Popen` + `worker.py` argv par requête** par un **pool de processus persistants** (`worker.py --persistent`) communiquant en **JSON une ligne** sur stdin/stdout. Chaque requête exécute le script dans un **nouveau `dict` namespace** (copie du template `from build123d import *`), sans réimporter la stack OCP. **Isolation OS + `RLIMIT_AS` (4 GiB par défaut)** et **watchdog `start.sh`** inchangés.
+
+Handshake **`WORKER_READY`** sur stderr : `pool.start()` n’affiche « démarré » qu’une fois chaque worker entré dans la boucle lecture (imports terminés), pour que la **première** requête `/preview` après `/health` reste rapide.
+
+## Performances (mesures locales, agent 2026-04-30)
+
+| Métrique | Avant (phase 5) | Après (phase 6) |
+|---|---|---|
+| Premier `/preview` après boot serveur (pool prêt) | ~2–4 s (import + exec par requête) | **~10–25 ms** (`Box(10,10,10)`, `curl` mesuré) |
+| `/preview` suivants (séquentiel) | ~2–4 s chacun | **~20 ms** ordre de grandeur |
+
+*Latence totale jusqu’à `GET /health` OK : coût du démarrage de N workers (~quelques secondes avec 2 workers, imports build123d séquentiels au spawn).*
+
+## Fichiers
+
+| Fichier | Action |
+|---|---|
+| `cadquery/worker.py` | Réécrit : mode `--persistent` (boucle JSON), template namespace copié par requête ; argv `<code_file> <out> <mode>` conservé hors serveur pour tests. Prévisualisation via `Preview.compute_preview`. |
+| `cadquery/pool.py` | **Nouveau** : `WorkerPool` (Queue idle, `execute` bloquant, recycle après timeout ou mort du worker, `shutdown` SIGTERM puis SIGKILL). |
+| `cadquery/server.py` | Pool global, `atexit.shutdown`, routes sur `pool.execute`, `/health` JSON avec `workers_alive` / `workers_total`, `threaded=True`. |
+| `.env.example` | `WORKER_POOL_SIZE`, `WORKER_REQUEST_TIMEOUT`. |
+
+## Variables d’environnement
+
+- `WORKER_POOL_SIZE` (défaut `2`)
+- `WORKER_REQUEST_TIMEOUT` (défaut `30`, fallback `CADQUERY_EXEC_TIMEOUT`)
+- `CADQUERY_WORKER_MEM_LIMIT_MB` — toujours appliqué dans chaque worker
+
+## Notes
+
+1. **Segfault natif** (ex. `ctypes.string_at(0)`) : sous **WSL2**, observation d’un délai d’environ **~11 s** avant réaping du PID alors que `SIGSEGV` est immédiat côté shell ; le **timeout 30 s** du pool reste le filet de sécurité et `/health` retrouve `workers_alive == workers_total` après recycle.
+2. **Réponses `/preview` volumineuses** : une seule ligne JSON sans indentation ; `flush` systématique côté worker ; `bufsize=1`, `PYTHONUNBUFFERED=1`.
+3. **`/health`** : corps JSON (plus de `text/plain ok`) ; le probe `curl -sf` de `start.sh` reste valide (HTTP 2xx).
+
+## Tests d’acceptation (phase 6)
+
+À valider manuellement : cold start `<500 ms` sur première requête une fois le serveur prêt ; 20 requêtes séquentielles ; 5 `curl` parallèles ; isolation `leaked` ; crash / timeout ; fuite mémoire 100 fillets ; `SIGTERM` Flask ; `kill -9` watchdog ; non-régression phase 5 (1–9).
+
+## Stratégie de commits
+
+1. `feat: add persistent worker pool` — worker + pool + `.env.example`
+2. `feat: wire flask routes to worker pool` — `server.py`
+3. `fix: wait for WORKER_READY before pool start returns`
+4. `docs: update STATUS for phase 6` — ce fichier
 
 ---
 
