@@ -623,3 +623,126 @@ Codes individuels disponibles à `/tmp/llmcad-phase4/test{1..10}.py`, récap bru
 7. **Aucune modification du frontend, du Node hors `SYSTEM_PROMPT`, du serveur Python ou du validateur** — comme demandé. Le `cleanCode()` continue d'extraire le code d'éventuels code-fences (le nouveau prompt interdit explicitement les fences, mais le strip défensif reste en place ; vérifié sur les 10 tests : aucune génération n'en contenait).
 8. **Pas de retry automatique exploité ici** — les tests appellent directement `/api/preview` après `/api/generate`, sans passer par la logique de retry du frontend (`web/js/chat.js`). En usage réel via le chat, les 5 cas en `FAIL preview` (tests 3, 4, 8, 9, 10) déclencheraient un retry automatique avec le message d'erreur en clair, ce qui pourrait sauver les tests 3 (chaîne `translate` cassée — message explicite) et peut-être 4. Les tests 8 et 9 ne seraient pas sauvés tant que le validateur n'autorise pas Assembly. Le test 10 (socket hang up) déclencherait un retry mais le serveur Python étant crashé, il faudrait un redémarrage manuel.
 9. **Latence acceptable** — ~10 s de médiane est compatible avec l'UX du chat (indicateur de chargement déjà en place phase 3). Le prompt long ne ralentit pas significativement Qwen3 32B FP8 vs un prompt court (mesure directe : 5.6 s avec long prompt vs 9.4 s avec court prompt sur le même test 2 — variabilité serveur dominante).
+
+---
+
+# Phase 4.5 — Isolation subprocess + Assembly support
+
+Date : 2026-04-30
+
+## Résumé
+
+Deux problèmes diagnostiqués en phase 4 sont corrigés :
+
+- **Problème A — crash natif OCC tuait Flask** : le timeout `threading` de la phase 3.5 ne pouvait pas tuer un thread Python, et un segfault dans le kernel OpenCascade emportait tout le process Flask (port 5002 disparu, redémarrage manuel obligatoire — cf. phase 4 test 10).
+- **Problème B — `cq.Assembly` rejeté par le validateur** : le system prompt phase 4 encourageait `cq.Assembly` + `cq.Location` pour les pièces multi-corps (enclosure + lid, etc.), mais `CadQueryValidator.allowed_cq_operations` ne contenait pas ces noms (cf. phase 4 tests 8 et 9 — FAIL).
+
+Architecture corrigée :
+
+- Chaque exécution `/preview|/stl|/step` est lancée dans un **subprocess Python dédié** (`cadquery/worker.py`) avec `subprocess.Popen + communicate(timeout=30)`. Timeout dépassé → `subprocess.kill()` + HTTP 400. Crash natif (segfault, abort, libc OOM) → exit code != 0 → HTTP 400 avec stderr remonté en clair. Flask reste vivant.
+- `RLIMIT_AS` est appliqué dans le worker au démarrage (avant l'import de cadquery) — finalement applicable, le parent Flask n'est plus dans cet espace d'adressage.
+- Une route `GET /health` (200 `ok`) sert de probe pour un **watchdog dans `start.sh`** : un superviseur en boucle ping `http://127.0.0.1:5002/health` toutes les 30 s ; si la sonde échoue (ou si le PID disparaît), `kill -9` puis relance automatiquement.
+- Le validateur whitelist `Assembly`, `Location`, `Color` (et quelques autres constructeurs) côté `cq.<X>(...)`. Les méthodes appelées sur la variable utilisateur (`assy.add(...)`, `assy.toCompound()`) étaient déjà acceptées (le validateur ne contraint que les attributs sur `cq`/`math`/`np`).
+- `Preview.py` et `worker.py` acceptent désormais un `result` de type `cq.Workplane`, `cq.Assembly`, `cq.Compound` ou `cq.Solid`. Pour les exports, un `Assembly` est converti en `Compound` via `assy.toCompound()` avant d'appeler `cq.exporters.export` (qui ne sait pas manger un `Assembly` directement).
+
+Aucune modification du frontend ni du Node.
+
+## Fichiers modifiés / créés
+
+| Fichier | État | Détails |
+|---|---|---|
+| `cadquery/server.py` | réécrit (~⅓ remplacé) | Suppression du runner `threading.Thread` + sandbox builtins. Nouveau `_run_worker(code, mode, suffix)` qui valide → écrit le code dans un fichier temporaire (`tempfile.mkstemp(prefix="cqcode_")`) → spawn `python worker.py <code> <out> <mode>` → `communicate(timeout=EXEC_TIMEOUT_SEC)`. Cleanup des temp files dans des `finally`. Routes `/stl` et `/step` slurpent le fichier en mémoire (`io.BytesIO`) et le suppriment immédiatement, parce que `send_file(path) + call_on_close` du dev-server Werkzeug peut ne pas se déclencher (client deconnecté, race) et laisse fuir des fichiers de plusieurs Mo dans `/tmp`. Nouvelle route `GET /health` qui retourne `200 ok` sans toucher au worker (pour que le probe soit léger). Variables de config inchangées (`CADQUERY_HOST`, `CADQUERY_PORT`, `CADQUERY_EXEC_TIMEOUT`). |
+| `cadquery/worker.py` | **nouveau** | Script appelé par `server.py` via subprocess. Argv : `<code_file> <output_file> <mode>` (mode = `preview \| stl \| step`). Applique `RLIMIT_AS` AVANT d'importer cadquery (sinon le cap n'a aucun effet sur les mmaps déjà faits). Reconstruit le sandbox builtins + `_sandbox_import` à partir de `CadQueryValidator.allowed_builtins` (defense in depth — le validateur a déjà tourné côté Flask). Tessélise (preview) ou exporte (stl/step) en gérant `Workplane`/`Assembly`/`Compound`/`Solid`. Exit codes : 0 succès, 1 erreur Python/CadQuery (avec traceback complet sur stderr), 2 erreur d'arguments. |
+| `cadquery/CadQueryValidator.py` | mineur | Ajout dans `allowed_cq_operations` : `Assembly`, `Location`, `Color`, `toCompound`, `save`, `Vector`, `Plane`. Aucun autre changement. |
+| `cadquery/Preview.py` | réécrit | Helper `_result_solids(result)` qui normalise `Workplane.objects` / `Assembly.toCompound().Solids()` / `Compound.Solids()` / bare `Solid`. Le code de tessellation est inchangé pour les Workplane (parité numérique vérifiée — voir tests). Conserve la signature `preview(result) -> (dict, error)` pour compatibilité. |
+| `start.sh` | étendu | Le serveur Python est maintenant lancé par un superviseur (subshell `while true`). Boucle interne : tant que le PID est vivant, sleep `CADQUERY_HEALTH_INTERVAL` (30 s par défaut), puis `curl -sf -m $CADQUERY_HEALTH_TIMEOUT http://127.0.0.1:5002/health` ; sur échec, `kill -9` et break. Boucle externe : sleep 1, relance. `cleanup()` dans le trap `INT TERM` envoie `SIGTERM` au superviseur **et** `pkill -f "python server.py"` pour les workers orphelins. `wait` cible désormais `NODE_PID` (le superviseur est conçu pour ne jamais terminer normalement). |
+
+## Configuration / variables d'environnement
+
+Nouvelles ou modifiées (toutes optionnelles, valeurs par défaut sensées) :
+
+| Variable | Défaut | Effet |
+|---|---|---|
+| `CADQUERY_EXEC_TIMEOUT` | `30` (s) | Wall-clock max d'un script utilisateur dans le worker. |
+| `CADQUERY_WORKER_MEM_LIMIT_MB` | `2048` (MiB) | `RLIMIT_AS` appliqué dans le worker. `0` = désactivé. **Ne pas baisser sous ~1500** : `import cadquery` à lui seul réserve ~1,3 GiB de VA (mesure : `VmPeak: 1315656 kB` après `import cadquery`). La spec phase 4.5 demandait 1 GiB ; ce n'est pas tenable avec cadquery 2.7 + cadquery-ocp 7.8.1.1 + numpy 2.4.4 — voir « Points d'attention » §1. |
+| `CADQUERY_HEALTH_INTERVAL` | `30` (s) | Période de probe `/health` du superviseur dans `start.sh`. |
+| `CADQUERY_HEALTH_TIMEOUT` | `5` (s) | Timeout HTTP du `curl` du superviseur. |
+
+`CADQUERY_MEM_LIMIT_MB` (phase 3.5, sur le **process Flask**) reste reconnu mais n'est plus appliqué — Flask ne fait plus tourner le code utilisateur, donc capper sa VA n'a plus de sens. La variable peut être enlevée du `.env` sans conséquence.
+
+## Tests effectués (2026-04-30)
+
+Stack lancée via `./start.sh`. Tests via `curl` direct sur `127.0.0.1:5002` (Flask) ou `127.0.0.1:49157/api/*` (Node, soumis au rate-limiter 30/10min).
+
+### Tests fonctionnels
+
+| # | Test | Attendu | Obtenu |
+|---|---|---|---|
+| A | `GET /health` (sans worker) | 200 `ok` | 200 `ok` (Content-Type `text/plain`, 2 octets) |
+| B | `POST /api/preview` `cq.Workplane("XY").box(50,30,10).edges().fillet(2)` (régression phase 3) | 200, mesh non vide | 200, 288 vertices / 276 faces / 1 solide. **Parité numérique** vérifiée vs ancien `Preview.py` exécuté en isolation (288/276/1 dans les deux cas). |
+| C | `POST /api/preview` Assembly enclosure+lid (cq.Assembly + cq.Location, `result = assy.toCompound()`) | 200, mesh non vide | 200, 504 vertices / 456 faces / 6 solides |
+| D | `POST /api/step` même Assembly | fichier STEP valide | 200, 95 KB, en-tête `ISO-10303-21;`, 6 `MANIFOLD_SOLID_BREP` |
+| E | `POST /api/stl` même Assembly | fichier STL valide | 200, 1284 octets, en-tête `STL Exported by Open CASCADE Technology` |
+| F | Variante `+50% bigger` du test C (180×120×60, parois 3 mm, lid 7,5 mm) | 200, mesh non vide | 200, 550 vertices / 516 faces / 6 solides — confirme que les itérations « scale » sur du code Assembly fonctionnent (FAIL en phase 4 test 9) |
+
+### Tests d'isolation / robustesse
+
+| # | Test | Attendu | Obtenu |
+|---|---|---|---|
+| 8 | Boucle CPU runaway (`for i in range(10**12): total += i; result = cq.Workplane("XY").box(1,1,1)`) | HTTP 400 après ~30 s, Flask vivant, requête suivante OK | HTTP 400 en **30,0 s exactement** : `Execution timeout exceeded (30s). Possible infinite loop or runaway computation.`. `/health` répond 200 immédiatement après. Une requête `box(20,20,20)` ensuite renvoie 200 et un mesh valide. |
+| 9 | `kill -9` du process worker mid-exécution (script de ~11 s : 60 unions de petits cubes) | HTTP 400 propre avec exit code, Flask vivant, requête suivante OK | HTTP 400 : `Worker exited with code -9 (signal 9)`. `/health` 200. Requête `box(6,6,6)` ensuite : 200 + mesh valide. |
+| 9b | Crash mémoire natif sous `RLIMIT_AS` (script > 80 cuts en chaîne) | HTTP 400 lisible, Flask vivant | HTTP 400 : `cannot allocate memory for thread-local data: ABORT` (libc abort intercepté côté worker, stderr remonté). Flask vivant. |
+| 11 | Watchdog : `kill -9` du PID Python listener (PID extrait de `ss -ltnp`) | Port 5002 réapparaît dans ≤ 60 s, requête suivante OK | Port relancé à **t=20 s** (~18 s de sleep restant sur la boucle de probe + ~2 s de réimport de cadquery). Nouveau PID Flask différent de l'ancien (`110461 → 113012`). Requête `box(12,12,12)` ensuite : 200 + mesh valide. Log superviseur visible dans `/tmp/llmcad-start.log`. |
+
+### Tests de sécurité (régression validateur)
+
+| Test | Attendu | Obtenu |
+|---|---|---|
+| `import os` | rejet validateur | 400 `Validation failed: Import of 'os' is not allowed` |
+| `eval("1+1")` | rejet validateur | 400 `Validation failed: Function call to 'eval' is not allowed` |
+| `assy.add(box, color=cq.Color(1,0,0))` | accepté validateur | OK |
+| Code sans `result = …` | rejet validateur (early) | 400 `Code must assign to 'result' variable` |
+| `result = 42` | rejet runtime côté worker | 400 `No solids found in result` |
+| `1/0` dans le script | rejet runtime + traceback | 400 `ZeroDivisionError: division by zero` + traceback complet (utile au retry LLM) |
+
+### Tests de propreté
+
+| Test | Attendu | Obtenu |
+|---|---|---|
+| 10 cycles `/api/preview` + `/api/stl` + `/api/step` | aucun `cqout_*`, `cqcode_*` rémanent dans `/tmp` après réponse | 0 fichier rémanent (slurp en mémoire + `os.unlink` immédiat sur les exports ; cleanup dans `finally` sur les autres). |
+
+### Tests phase 4 réémis (cf. spec §12)
+
+Les tests phase 4 #8 (« enclosure box 120×80×40mm avec wall thickness 2 mm + lid ») et #9 (« 50 % bigger ») étaient FAIL en phase 4 sur la validation (`Assembly` / `Location` non whitelistés). En phase 4.5 :
+
+- Le **code généré par le LLM en phase 4** (qui contient `cq.Assembly()`, `cq.Location((0,0,40))`, `assy.add(...)`) passe la validation.
+- En remplaçant le LLM par un script équivalent forgé à la main (vLLM intermittent au moment du test, cf. phase 4 §2) : preview OK + STEP OK + STL OK (tests C/D/E ci-dessus).
+- L'itération `+50% bigger` (test F) sur le code Assembly produit un nouveau code qui passe aussi.
+
+Tests **non réémis** : phase 4 tests 1–7 (qui passaient déjà en phase 4). Test 10 (intake manifold qui crashait Flask) — non rejoué car la cause racine était précisément le crash natif OCC dans le process Flask, désormais isolé dans un worker. Si le LLM régénère un code similaire en chat, il devra renvoyer une 400 avec le stderr du crash, mais Flask restera up.
+
+### Tests interactifs (à valider dans le navigateur)
+
+- Bouton « Nouveau chat » + envoi d'un prompt « an enclosure 120×80×40mm with a 2mm wall and a lid » → preview affichée dans le viewer (boîte + couvercle empilés, 6 solides).
+- Export STL et STEP du résultat → téléchargement OK.
+- Pas de modification frontend, donc le comportement de retry automatique sur erreur reste identique (toujours 1 retry max).
+
+## Points d'attention / écarts
+
+1. **`CADQUERY_WORKER_MEM_LIMIT_MB` à 2048 et non 1024 (spec)** — la spec phase 4.5 affirmait « 1 GB suffit pour un script unique sans le poids idle de Flask+CadQuery chargé en mémoire du process parent ». **Faux dans les faits sur cette stack** : le worker, qui est un process Python neuf, doit lui aussi `import cadquery`, et cet import à lui seul réserve ~1,3 GiB de VA (mesure : `VmPeak: 1315656 kB` immédiatement après `import cadquery`, RSS ~440 MB). Avec `RLIMIT_AS=1 GiB`, le worker SIGSEGVE pendant l'import (testé : signal 11 reproductible). On a donc relevé le défaut à 2 GiB (~1,3 GiB d'idle + ~700 MiB pour le script). Override env-configurable. Pour un LXC très restreint, `CADQUERY_WORKER_MEM_LIMIT_MB=0` désactive complètement le cap.
+
+2. **`call_on_close` du dev-server Werkzeug n'est pas fiable** — sur la première itération de phase 4.5 j'ai gardé l'ancien pattern `send_file(path) + @response.call_on_close: os.unlink(path)`. Sur 3 cycles `/stl` + `/step` j'ai constaté 3 fichiers `/tmp/cqout_*.{stl,step}` rémanents. La cause : `call_on_close` ne se déclenche pas systématiquement sur le dev-server (race avec la fermeture du socket, plus visible sur localhost loopback). Solution : slurp dans un `io.BytesIO`, unlink immédiat, retour de `send_file(BytesIO)`. Coût mémoire négligeable (STL/STEP < 1 Mo dans les cas testés). Le `/preview` n'était pas affecté (pas de `send_file(path)` — le JSON est lu et renvoyé directement).
+
+3. **Latence ajoutée par le subprocess** — chaque requête paye un `import cadquery` complet (~2 s). Sur du code utilisateur trivial (`box(10,10,10)`), la latence end-to-end passe de ~50 ms (phase 3.5 in-process) à ~2,5 s. Sur du code complexe (15+ opérations), c'est dominé par CadQuery (~5–15 s) donc le surcoût est imperceptible. Acceptable pour l'usage chat (l'indicateur de chargement existe déjà). Pour un cas multi-utilisateurs lourd il faudrait un pool de workers pré-warmés (multiprocessing.Pool ou un manager type uWSGI vassal) — hors scope phase 4.5.
+
+4. **Watchdog : recovery en 20–60 s, pas instantané** — la boucle de probe sleep 30 s entre deux ping. Quand on `kill -9` Flask, le superviseur ne voit la mort qu'au prochain réveil (au pire à t=29 s) puis sleep 1 s avant relance (~2 s de réimport). Donc fenêtre d'indisponibilité **2 à 32 s**, médiane ~17 s (mesure : `t=20 s` sur le run de test). Pour une recovery quasi-instantanée il faudrait soit baisser `CADQUERY_HEALTH_INTERVAL` (mais charge inutile sur le serveur en steady state), soit utiliser `wait` sur le PID en parallèle du sleep (technique : `sleep & wait -n $cq_pid $!`), ce qui déclencherait la relance dès le `SIGCHLD`. Acceptable en l'état pour un usage perso.
+
+5. **Hiérarchie d'Assembly perdue dans STEP** — `cq.exporters.export(cq.Assembly, …)` ne fonctionne pas (`AttributeError: 'str' object has no attribute 'wrapped'`). On collapse via `assy.toCompound()` avant export. Conséquence : les noms de parts (`name="enclosure"`, `name="lid"`) ne se retrouvent pas dans le STEP. Pour préserver la hiérarchie il faudrait détecter `isinstance(result, cq.Assembly)` côté worker et appeler `result.save(output_path, exportType="STEP")` (méthode native d'Assembly). Trade-off : le fichier devient un assembly STEP de niveau supérieur (PRODUCT_DEFINITION_RELATIONSHIP, …) — utile pour l'import dans un CAD lourd, mais nos previews three.js voient déjà la géométrie collapsée. À reconsidérer si un utilisateur final demande explicitement la structure préservée.
+
+6. **Defense in depth dans le worker** — le worker reconstruit le même sandbox builtins/imports qu'avait `server.py` en phase 3.5 (`_sandbox_import`, `safe_builtins` issus de `CadQueryValidator.allowed_builtins`), bien que le validateur Python complet ait déjà tourné côté Flask. C'est volontairement redondant : si jamais un futur changement de `validator.validate()` laisse passer `eval`, le runtime du worker continue de le bloquer (tentative dans le sandbox → `NameError`). Aucun coût mesurable.
+
+7. **Aucune modification du frontend ni du Node.js** — comme demandé. `node/RequestQueue.js`, `node/server.js`, `node/llm.js`, `web/*` inchangés. La latence accrue (~2 s par requête) est invisible côté chat — le retry automatique sur erreur fonctionne pareil, et un crash worker remonte un message d'erreur en clair que le LLM peut consommer.
+
+8. **Logs serveur Python** — toujours redirigés vers stdout du process `start.sh` (pas dans `logs/`). Avec le superviseur, à chaque relance les logs reprennent au début (les requêtes pendant la coupure sont des HTTP 502 côté Node, log `requests-YYYY-MM-DD.log` les capture comme erreurs). Un `gunicorn --access-logfile logs/cadquery-access.log` pourrait être utile en production — pas changé en phase 4.5 puisque hors scope.
+
+9. **`while True: pass` côté validateur reste détecté côté validation** — pas de régression. Le subprocess garantit en plus que `for i in range(10**12): pass` (qui échappe au validateur car ce n'est pas `while True`) est tué à 30 s — ce qui n'était pas le cas en phase 3.5 (le thread continuait à tourner après le timeout, indéfiniment, jusqu'à redémarrage).

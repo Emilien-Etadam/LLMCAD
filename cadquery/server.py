@@ -1,24 +1,37 @@
 """
 @file server.py
-@brief Process CadQuery requests and send using Flask
-@author 30hours (bare-metal adaptation)
+@brief Flask front-end for the CadQuery sandbox (bare-metal adaptation).
+
+@author 30hours
+
+Phase 4.5 — process isolation:
+    Each /preview, /stl, /step request is now executed by a fresh
+    `worker.py` subprocess instead of an in-process thread. This means:
+      * Wall-clock timeouts are enforced via subprocess.kill, including for
+        runaway native (OpenCascade) code that previously kept a Python
+        thread alive forever.
+      * A segfault inside libTKBO/libTKMath/etc. only kills the worker;
+        Flask stays up and the next request goes through.
+      * `RLIMIT_AS` can finally be applied — it lives inside worker.py
+        (default 2 GiB; configurable via CADQUERY_WORKER_MEM_LIMIT_MB) and
+        only caps the user script, not the long-lived Flask process which
+        legitimately reserves >1 GiB at idle.
+
+The validator (CadQueryValidator) still runs in-process; we only spawn a
+subprocess once the script is known to be syntactically and statically OK.
 """
 
-import builtins as _builtins
+import io
 import json
-import math
 import os
-import resource
+import subprocess
+import sys
 import tempfile
-import threading
 from pathlib import Path
 
-import cadquery as cq
-import numpy as np
 from flask import Flask, request, send_file
 
 from CadQueryValidator import CadQueryValidator
-from Preview import preview
 
 try:
     from dotenv import load_dotenv
@@ -29,164 +42,186 @@ try:
 except ImportError:
     pass
 
+
 app = Flask(__name__)
 validator = CadQueryValidator()
 
+# --- Paths / config ----------------------------------------------------------
 
-# --- Sandbox configuration ---------------------------------------------------
+_HERE = Path(__file__).resolve().parent
+_WORKER = _HERE / "worker.py"
+_PYTHON = sys.executable
 
-# Hard wall-clock cap on a single /preview|/stl|/step execution.
 EXEC_TIMEOUT_SEC = float(os.environ.get("CADQUERY_EXEC_TIMEOUT", "30"))
 
-# Optional virtual-address-space cap (RLIMIT_AS), in MB. Disabled by default
-# because CadQuery + cadquery-ocp + numpy easily reserve >1 GB of VA at idle
-# (see STATUS.md phase 3.5). Operators on a constrained LXC can override via
-# `CADQUERY_MEM_LIMIT_MB=512 ./start.sh`.
-MEM_LIMIT_MB = int(os.environ.get("CADQUERY_MEM_LIMIT_MB", "0"))
 
-# Modules importable from inside the sandbox. Mirrors the validator whitelist.
-_RUNTIME_ALLOWED_IMPORTS = {"cadquery", "math", "numpy", "typing"}
+# --- Subprocess driver -------------------------------------------------------
 
 
-def _sandbox_import(name, globals=None, locals=None, fromlist=(), level=0):
-    """Restricted __import__: only modules on the runtime whitelist."""
-    if level != 0:
-        raise ImportError("Relative imports are not allowed in sandbox")
-    root = name.split(".")[0]
-    if root not in _RUNTIME_ALLOWED_IMPORTS:
-        raise ImportError(f"Import of '{name}' is not allowed in sandbox")
-    return __import__(name, globals, locals, fromlist, level)
-
-
-def _build_safe_builtins():
-    safe = {
-        name: getattr(_builtins, name)
-        for name in validator.allowed_builtins
-        if hasattr(_builtins, name)
-    }
-    # Restricted import so that `import math` / `from typing import List`
-    # work inside user code without exposing arbitrary modules.
-    safe["__import__"] = _sandbox_import
-    return safe
-
-
-def _apply_memory_limit():
-    """Best-effort RLIMIT_AS cap. Logs (and continues) on failure."""
-    if MEM_LIMIT_MB <= 0:
-        return
-    try:
-        target = MEM_LIMIT_MB * 1024 * 1024
-        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-        if hard != resource.RLIM_INFINITY:
-            new_hard = min(target, hard)
-        else:
-            new_hard = target
-        new_soft = min(target, new_hard)
-        resource.setrlimit(resource.RLIMIT_AS, (new_soft, new_hard))
-        print(f"[server] RLIMIT_AS set to {MEM_LIMIT_MB} MB")
-    except (ValueError, OSError) as exc:
-        print(
-            f"[server] Could not set RLIMIT_AS to {MEM_LIMIT_MB} MB "
-            f"(LXC restriction? {exc}); continuing without memory cap."
-        )
-
-
-_apply_memory_limit()
-
-
-# --- Execution --------------------------------------------------------------
-
-
-def execute(code):
+def _run_worker(code: str, mode: str, output_suffix: str):
     """
-    @brief All remote code execution goes through this function.
-      - Validates the code via CadQueryValidator
-      - Executes inside a restricted-builtins sandbox in a worker thread
-      - Aborts (returns an error) if the worker exceeds EXEC_TIMEOUT_SEC
+    @brief Validate + run a user script in an isolated subprocess.
+    @param code Raw user code.
+    @param mode One of 'preview', 'stl', 'step'.
+    @param output_suffix Extension for the worker's output file
+                         ('.json', '.stl', '.step').
+    @return (output_path, error)
+            output_path: path to the worker's output file (caller is
+                         responsible for cleanup) or None on error.
+            error:       error message string or None on success.
+
+    Lifecycle:
+        1. Run the static validator. Reject (None, message) on failure.
+        2. Write the cleaned code to a temp file.
+        3. Spawn `python worker.py <code> <output> <mode>` with timeout.
+        4. On timeout: kill, cleanup, return ("Execution timeout exceeded …").
+        5. On non-zero exit: return (None, stderr-summary).
+        6. On success: return (output_path, None).
     """
     cleaned_code, error = validator.validate(code)
     if error:
         return None, error
 
-    safe_builtins = _build_safe_builtins()
-    globals_dict = {
-        "cq": cq,
-        "np": np,
-        "math": math,
-        "__builtins__": safe_builtins,
-    }
-    locals_dict = {}
-
-    state = {"error": None}
-
-    def runner():
+    code_fd, code_path = tempfile.mkstemp(suffix=".py", prefix="cqcode_")
+    out_fd, output_path = tempfile.mkstemp(suffix=output_suffix, prefix="cqout_")
+    os.close(out_fd)
+    try:
+        with os.fdopen(code_fd, "w", encoding="utf-8") as fh:
+            fh.write(cleaned_code)
+    except Exception:
         try:
-            exec(cleaned_code, globals_dict, locals_dict)
-        except BaseException as exc:  # noqa: BLE001 - report any user-code failure
-            state["error"] = f"{type(exc).__name__}: {exc}"
+            os.unlink(code_path)
+        except OSError:
+            pass
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+        raise
 
-    worker = threading.Thread(target=runner, daemon=True)
-    worker.start()
-    worker.join(EXEC_TIMEOUT_SEC)
-    if worker.is_alive():
-        # We cannot forcibly kill a CPython thread, but we surface the timeout
-        # to the caller; the daemon thread will be torn down with the process.
-        return None, (
-            f"Execution timeout exceeded ({EXEC_TIMEOUT_SEC:g}s). "
-            "Possible infinite loop or runaway computation."
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [_PYTHON, str(_WORKER), code_path, output_path, mode],
+            cwd=str(_HERE),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-    if state["error"] is not None:
-        return None, state["error"]
-    return locals_dict, None
+        try:
+            stdout, stderr = proc.communicate(timeout=EXEC_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            return None, (
+                f"Execution timeout exceeded ({EXEC_TIMEOUT_SEC:g}s). "
+                "Possible infinite loop or runaway computation."
+            )
+
+        if proc.returncode != 0:
+            err = (stderr or "").strip()
+            if not err:
+                signal_hint = ""
+                if proc.returncode is not None and proc.returncode < 0:
+                    signal_hint = f" (signal {-proc.returncode})"
+                err = f"Worker exited with code {proc.returncode}{signal_hint}"
+            return None, err
+
+        return output_path, None
+    finally:
+        try:
+            os.unlink(code_path)
+        except OSError:
+            pass
+        # NOTE: output_path cleanup is the caller's job on success;
+        # on failure we wipe it here to avoid leaking temp files.
+        if proc is None or proc.returncode != 0:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
 
 
 def make_response(data=None, message="Success", status=200):
-    """
-    @brief Generic function to send HTTP responses
-    """
+    """@brief Generic JSON response helper (matches phases 1–4)."""
     return (
         json.dumps({"data": data if data else "None", "message": message}),
         status,
     )
 
 
+# --- Routes ------------------------------------------------------------------
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """
+    @brief Liveness probe used by start.sh's watchdog.
+
+    Returns 200 'ok' as long as the Flask app is reachable. We deliberately
+    do NOT spawn a worker here so that the watchdog can ping cheaply every
+    30 s without warming up a CadQuery import.
+    """
+    return ("ok", 200, {"Content-Type": "text/plain"})
+
+
 @app.route("/preview", methods=["POST"])
 def run_preview():
+    output_path = None
     try:
         code = request.json["code"]
-        output, error = execute(code)
+        output_path, error = _run_worker(code, "preview", ".json")
         if error:
             return make_response(message=error, status=400)
-        mesh_data, error = preview(output["result"])
-        if error:
-            return make_response(message=error, status=400)
+        with open(output_path, "r", encoding="utf-8") as fh:
+            mesh_data = json.load(fh)
         return make_response(data=mesh_data, message="Preview generated successfully")
     except Exception as e:
         return make_response(message=str(e), status=500)
+    finally:
+        if output_path:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+
+
+def _send_export(code: str, mode: str, suffix: str, download_name: str):
+    """Common /stl + /step handler: run worker, stream the file from memory.
+
+    Why memory rather than `send_file(path)` + call_on_close: Flask's dev
+    server (Werkzeug) does not always fire call_on_close (e.g. when the
+    client disconnects, or with some forwarding setups), leaking temp
+    files in /tmp. STL/STEP outputs for our use case are small (<10 MB),
+    so we slurp them and unlink immediately.
+    """
+    output_path, error = _run_worker(code, mode, suffix)
+    if error:
+        return make_response(message=error, status=400)
+    try:
+        with open(output_path, "rb") as fh:
+            payload = fh.read()
+    finally:
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+    return send_file(
+        io.BytesIO(payload),
+        as_attachment=True,
+        download_name=download_name,
+        mimetype="application/octet-stream",
+    )
 
 
 @app.route("/stl", methods=["POST"])
 def run_stl():
     try:
         code = request.json["code"]
-        result, error = execute(code)
-        if error:
-            return make_response(message=error, status=400)
-        model = result["result"]
-        temp_file = tempfile.NamedTemporaryFile(suffix=".stl", delete=True)
-        cq.exporters.export(model, temp_file.name)
-        response = send_file(
-            temp_file.name,
-            as_attachment=True,
-            download_name="model.stl",
-            mimetype="application/octet-stream",
-        )
-
-        @response.call_on_close
-        def cleanup():
-            temp_file.close()
-
-        return response
+        return _send_export(code, "stl", ".stl", "model.stl")
     except Exception as e:
         return make_response(message=str(e), status=500)
 
@@ -195,24 +230,7 @@ def run_stl():
 def run_step():
     try:
         code = request.json["code"]
-        result, error = execute(code)
-        if error:
-            return make_response(message=error, status=400)
-        model = result["result"]
-        temp_file = tempfile.NamedTemporaryFile(suffix=".step", delete=True)
-        cq.exporters.export(model, temp_file.name)
-        response = send_file(
-            temp_file.name,
-            as_attachment=True,
-            download_name="model.step",
-            mimetype="application/octet-stream",
-        )
-
-        @response.call_on_close
-        def cleanup():
-            temp_file.close()
-
-        return response
+        return _send_export(code, "step", ".step", "model.step")
     except Exception as e:
         return make_response(message=str(e), status=500)
 
@@ -222,8 +240,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("CADQUERY_PORT", "5002"))
     print(f"CadQuery server starting on http://{host}:{port}")
     print(
-        f"[server] sandbox: exec_timeout={EXEC_TIMEOUT_SEC:g}s, "
-        f"mem_limit_mb={MEM_LIMIT_MB or 'disabled'}, "
-        f"runtime_imports={sorted(_RUNTIME_ALLOWED_IMPORTS)}"
+        f"[server] subprocess sandbox: exec_timeout={EXEC_TIMEOUT_SEC:g}s, "
+        f"worker={_WORKER.name}"
     )
     app.run(host=host, port=port)

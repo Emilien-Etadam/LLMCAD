@@ -106,6 +106,14 @@ class CadQueryValidator:
             'intersect', 'combine', 'each',
             # measurement and inspection
             'val', 'vals', 'dump',
+            # assembly / placement (multi-part scripts)
+            # `cq.Assembly(...)`, `cq.Location(...)`, `cq.Color(...)` are
+            # constructors on the cq module. Subsequent method calls (`.add`,
+            # `.toCompound`, `.save`) live on user-bound names and therefore
+            # are not validated against this set, but we list common names
+            # here for robustness when chained directly off `cq.`.
+            'Assembly', 'Location', 'Color',
+            'toCompound', 'save', 'Vector', 'Plane',
             # string constants for plane selection
             'XY', 'YZ', 'XZ', 'front', 'back', 'left',
             'right', 'top', 'bottom',
