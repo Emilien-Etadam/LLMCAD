@@ -419,3 +419,207 @@ Tests complémentaires effectués en isolation (smoke test direct sur la classe 
 5. **Pré-collecte des noms en `ast.walk`** — pas de scoping. Une variable définie dans un `def f(): x = 1` est trustée au top-level. C'est volontaire : le validateur n'a pas à analyser la portée pour qu'un appel `x()` au top-level échoue à l'exécution avec `NameError`. Aucune voie d'échappement utile.
 6. **Pas de modification frontend ni Node.js** — l'erreur de timeout / validation remonte telle quelle dans la zone `output-message`, et `chat.js` enclenche son retry automatique habituel. Le system prompt LLM peut maintenant utiliser `def`, `for`, list comprehensions ; à éventuellement enrichir en phase 4.
 7. **Le test « simple gear » de la phase 3** devrait maintenant passer côté validateur si le LLM utilise `def` + `math.cos`/`math.sin` (re-test ad hoc à faire en interactif). `cq.Sketch` reste hors `allowed_cq_operations` ; à ajouter au cas par cas si on rencontre des modèles qui en ont besoin.
+
+---
+
+# Phase 4 — System prompt CadQuery
+
+Date : 2026-04-29
+
+## Résumé
+
+Réécriture du `SYSTEM_PROMPT` dans `node/llm.js` pour cadrer la génération CadQuery par Qwen3 32B. Le prompt passe de **6 lignes / ~470 caractères** à **136 lignes / 4872 caractères** (1623 tokens côté `prompt_tokens` mesuré sur vLLM, le reste de l'overhead venant du chat template Qwen3). Il regroupe : règles dures (imports/sandbox), une référence d'API CadQuery (workplane, primitives 2D, dessin 2D, opérations 3D, transforms, sélecteurs, patterns, assemblies), 5 patterns d'exemple, et une liste de pièges typiques.
+
+**Aucun autre fichier modifié.** La logique d'appel vLLM, le nettoyage de code (`cleanCode`), la construction des messages (`buildMessages`), le timeout 30 s, le rate-limiter Node, le validateur Python et le frontend sont identiques à la phase 3.5.
+
+## Modif `node/llm.js`
+
+Seule la valeur de la constante `SYSTEM_PROMPT` change. Le prompt embarqué est exactement (verbatim) :
+
+```
+You are a CadQuery code generator. You output ONLY valid Python code. No explanations, no markdown, no code fences, no comments unless they clarify complex geometry logic.
+
+HARD RULES:
+- Always start with: import cadquery as cq
+- You may also import math and typing if needed. No other imports.
+- The final 3D object MUST be assigned to a variable named "result"
+- Never use show_object(), cq.exporters, or any display/export function
+- Never use eval(), exec(), open(), os, sys, subprocess, or any system call
+- Never access dunder attributes (__class__, __bases__, __import__, etc.)
+- If the user provides existing code and asks for a modification, return the FULL modified code, not a diff or partial snippet
+
+CADQUERY API REFERENCE (use only these):
+
+Workplane creation:
+  cq.Workplane("XY" | "XZ" | "YZ")
+  .transformed(offset=(x,y,z), rotate=(rx,ry,rz))
+
+2D Primitives (on workplane):
+  .rect(xLen, yLen, centered=True)
+  .circle(radius)
+  .ellipse(x_radius, y_radius)
+  .polygon(nSides, diameter)
+  .slot2D(length, diameter, angle=0)
+  .text(txt, fontsize, distance, cut=True/False, font="Arial")
+
+2D Drawing:
+  .moveTo(x, y)
+  .lineTo(x, y)
+  .line(dx, dy)
+  .hLine(distance), .vLine(distance)
+  .hLineTo(x), .vLineTo(y)
+  .threePointArc(p1, p2)
+  .sagittaArc(endPoint, sag)
+  .radiusArc(endPoint, radius)
+  .tangentArcPoint(endpoint)
+  .spline(listOfXYTuple)
+  .polyline(listOfXYTuple)
+  .close()
+  .mirrorX(), .mirrorY()
+  .offset2D(distance)
+  .wire()
+
+3D Operations:
+  .extrude(distance, combine=True, both=False)
+  .revolve(angleDegrees=360, axisStart=(0,0,0), axisEnd=(0,1,0))
+  .sweep(path, multisection=False)
+  .loft(ruled=False)
+  .shell(thickness) — hollows the solid
+  .cut(other) — boolean subtract
+  .union(other) — boolean add
+  .intersect(other) — boolean intersect
+  .hole(diameter, depth=None)
+  .cboreHole(diameter, cboreDiameter, cboreDepth, depth=None)
+  .cskHole(diameter, cskDiameter, cskAngle, depth=None)
+
+Transforms:
+  .translate((x, y, z))
+  .rotateAboutCenter((ax, ay, az), angleDegrees)
+  .rotate((0,0,0), (0,0,1), angleDegrees)
+  .mirror("XY" | "XZ" | "YZ")
+
+Edge/Face Operations:
+  .edges(selector) — e.g. "|Z", ">Z", "<Z"
+  .faces(selector) — e.g. ">Z", "<X", "+Y"
+  .fillet(radius)
+  .chamfer(length)
+  .workplane(offset=0)
+
+Selectors (string):
+  ">X", "<X", ">Y", "<Y", ">Z", "<Z" — max/min along axis
+  "|X", "|Y", "|Z" — parallel to axis
+  "#X", "#Y", "#Z" — perpendicular to axis
+  "not(<selector>)" — negate
+  ">Z[-2]" — second from top
+  Combine with and/or: ">Z and |X"
+
+Patterns:
+  .rarray(xSpacing, ySpacing, xCount, yCount) — rectangular array of points
+  .polarArray(radius, startAngle, angle, count) — polar array of points
+  .pushPoints([(x1,y1), (x2,y2), ...]) — arbitrary point array
+
+Workplane chaining:
+  .faces(">Z").workplane() — new workplane on top face
+  .faces("<Z").workplane() — new workplane on bottom face
+  .center(x, y) — shift workplane origin
+
+Assembly (when multiple parts):
+  assy = cq.Assembly()
+  assy.add(part, name="name", loc=cq.Location((x,y,z), (rx,ry,rz)))
+  result = assy
+
+MODELING PATTERNS:
+
+Pattern 1 — Base with pocket:
+  result = (cq.Workplane("XY").rect(100,60).extrude(20)
+    .faces(">Z").workplane().rect(80,40).cutBlind(-15))
+
+Pattern 2 — Bolt hole pattern:
+  result = (cq.Workplane("XY").circle(50).extrude(10)
+    .faces(">Z").workplane()
+    .polarArray(35, 0, 360, 8).hole(5))
+
+Pattern 3 — Profile extrusion:
+  result = (cq.Workplane("XY")
+    .moveTo(0,0).lineTo(50,0).lineTo(50,10)
+    .lineTo(30,10).lineTo(30,40).lineTo(20,40)
+    .lineTo(20,10).lineTo(0,10).close()
+    .extrude(80))
+
+Pattern 4 — Revolution:
+  result = (cq.Workplane("XZ")
+    .moveTo(10,0).lineTo(20,0).lineTo(20,50)
+    .lineTo(15,55).lineTo(10,55).close()
+    .revolve(360, (0,0,0), (0,1,0)))
+
+Pattern 5 — Parametric with loops:
+  import math
+  result = cq.Workplane("XY").circle(50).extrude(5)
+  for i in range(8):
+      a = math.radians(i * 45)
+      result = result.cut(
+          cq.Workplane("XY")
+          .center(35 * math.cos(a), 35 * math.sin(a))
+          .circle(6).extrude(5))
+
+COMMON MISTAKES TO AVOID:
+- Do not chain .hole() after .edges().fillet() — do fillet last or use .faces(">Z").workplane() before .hole()
+- Do not use .extrude() on a 3D object — it works on 2D wire/face only
+- Do not forget .close() when drawing a profile with lineTo/line
+- .shell() removes a face first; call it on the solid, not on a workplane
+- .fillet() radius must be less than half the smallest edge length
+- When cutting holes in a pattern, .pushPoints() or loops are more reliable than .rarray() for non-grid layouts
+- For assemblies, each part must be a separate cq.Workplane chain, then added to cq.Assembly
+
+OUTPUT FORMAT:
+Return the complete Python script ready to execute. Start with imports, define any helper functions, then build the geometry, and end with the result assignment. Nothing else.
+```
+
+## Tests effectués
+
+Conditions :
+- vLLM `Qwen3 32B FP8` à `http://192.168.30.121:8000/v1` (modèle `/data/models/qwen3-32b-fp8`).
+- Stack lancée via `./start.sh` (Node + Python).
+- Pour chaque test, deux requêtes successives `POST /api/generate` puis `POST /api/preview`, équivalentes à ce que fait `web/js/chat.js` à la frappe **Envoyer**.
+- Les codes générés sont conservés dans `/tmp/llmcad-phase4/test{1..10}.py`, le récap brut dans `/tmp/llmcad-phase4/results.json`.
+- Tests itératifs (6 et 9) appelés avec `history = [user_N, assistant_N]` et `currentCode = code_test_N` — exactement comme le frontend.
+
+| # | Prompt | Gen | Preview | Description visuelle / observation |
+|---|---|---|---|---|
+| 1 | `a simple box 100x60x20mm with 3mm fillets on all edges` | OK 2.2 s, 115 B | OK 288 v / 276 f | Pavé droit `.rect(100,60).extrude(20)` puis `.edges("\|Z or \|X or \|Y").fillet(3)`. Tous les coins arrondis, géométrie correcte. |
+| 2 | `a flanged bearing housing: cylindrical bore 25mm, flange 80mm diameter 10mm thick, 4 bolt holes M8 on a 60mm bolt circle` | OK 9.3 s, 793 B | OK 108 v / 104 f | Flange Ø80×10 + corps cylindrique Ø25 (interprété comme la base avant cut), 4 bossages bolt-circle Ø60 reliés par `.union()` dans une boucle `for i in range(4)`, alésage central Ø25 par `.cut()`. Les bossages M8 sont **modélisés en pleine matière** (cylindres) au lieu de **trous** — interprétation littérale « bolt holes M8 » non corrigée par le prompt. Géométrie cohérente mais inversée fonctionnellement (à reformuler en « 4 holes for M8 bolts »). |
+| 3 | `an L-bracket: 80mm x 60mm x 5mm thick, with a 10mm hole in each arm` | OK 10.9 s, 795 B | **FAIL** : `ValueError: Can not return the Nth element of an empty list` | Code généré chaîne plusieurs `.translate(...)` au milieu de la pile, ce qui casse la sélection `.faces(">Z").workplane()` plus loin (la stack devient vide). Le LLM tente une L-bracket en deux `rect.extrude` reliés par `.union()` mais place les translations entre les opérations de sélection. Le prompt liste pourtant explicitement « do fillet last or use `.faces(">Z").workplane()` before `.hole()` » mais ne couvre pas le cas `translate` au milieu de la chaîne. |
+| 4 | `a spur gear, 20 teeth, module 2.5, 15mm face width, 10mm bore` | OK 16.1 s, 1529 B | **FAIL** : `StdFail_NotDone: GC_MakeArcOfCircle::Value() - no result` | Le LLM produit une fonction `def spur_gear(...)` avec `threePointArc` aux paramètres invalides (les 3 points sont colinéaires, OCC refuse de fabriquer un arc). Utilise aussi `.each(lambda i: ... .rotate(...))` qui n'est pas dans le prompt. Validateur OK (def + lambda + math.radians acceptés depuis phase 3.5), mais OCC échoue en interne. Engrenages involutes restent un point dur — il faudrait un Pattern dédié dans le prompt. |
+| 5 | `a phone stand that holds a phone at 60 degrees angle, 80mm wide` | OK 3.6 s, 204 B | OK 48 v / 28 f | Base 80×30×10 + dossier 80×10×10 incliné 60° via `.rotateAboutCenter((1,0,0), 60)`. Géométrie correcte, deux blocs visibles en équerre. Aucune encoche pour le téléphone (interprétation minimaliste du « phone stand »). |
+| 6 | (itératif sur 5) `add rubber grip pads as 2mm raised rectangles on the base` | OK 7.5 s, 517 B | OK 96 v / 52 f | Le code du test 5 est repris in extenso, puis deux pads `.rect(10,10).extrude(2)` sont positionnés à `(-30,-10,0)` et `(30,-10,0)` puis `union` à `result`. **Le prompt itératif fonctionne** — le LLM rend le FULL code modifié comme demandé par la HARD RULE. Deux pads seulement (non 4) : interprétation libre. |
+| 7 | `a hex socket head cap screw M10x30` | OK 4.2 s, 291 B | OK 54 v / 48 f | Tige Ø10×30 + tête Ø10×2 (proportions M10 incorrectes : la tête devrait être plus large que la tige) + empreinte hex `polygon(6,4.5).extrude(-5)` sur le dessus, le tout `translate` pour finir centré. Visuellement reconnaissable mais cotes hors standard ISO 4762. |
+| 8 | `a simple enclosure box 120x80x40mm with 2mm wall thickness, screw bosses in the 4 corners, and a lid that fits on top` | OK 10.8 s, 950 B | **FAIL** : `Validation failed: CadQuery operation 'Assembly' is not allowed; CadQuery operation 'Location' is not allowed` | Le LLM utilise `cq.Assembly()` + `cq.Location((0,0,40))` pour combiner base et couvercle — ce que le prompt **autorise explicitement** (« Assembly (when multiple parts) ») mais ce que le validateur de la phase 3.5 bloque (`Assembly` et `Location` ne sont pas dans `allowed_cq_operations`). Conflit entre le prompt et le validateur — voir « Points d'attention » ci-dessous. |
+| 9 | (itératif sur 8) `take the current code and make everything 50% bigger` | OK 11.8 s, 1024 B | **FAIL** : mêmes `Assembly` / `Location` interdits | Le code du test 8 est correctement rééchelonné : 120→180, 80→120, 40→60, parois 2→3, bossages 6→9, lid 5→7.5. La transformation arithmétique fonctionne. Mais le code hérite du `cq.Assembly` du test 8, donc validation échoue à l'identique. Démontre que les itérations « scale » sur du code rejeté restent rejetées tant que le code source est rejeté. |
+| 10 | `an intake manifold with 4 runners merging into a single plenum` | OK 11.0 s, 788 B | **FAIL** : `socket hang up` | Le LLM produit une chaîne de `.rect(60,60).extrude(20).faces(">Z").workplane().rect(60,60).extrude(10)` puis enchaîne plusieurs `.faces("<Z").workplane(centerOption="CenterOfMass").rect(20,20).extrude(-40)` et `.rarray(40,40,2,2).rect(20,20).extrude(-40)`. **Le serveur Python crashe** pendant l'exécution de cette chaîne (probablement OCC OOM ou segfault sur l'imbrication boolean) : `ss -ltnp` confirme que le port 5002 n'est plus en écoute après ce test. La queue Node `RequestQueue.js` reçoit donc `ECONNRESET`, traduit en « socket hang up ». Échec exécution, pas validation. |
+
+### Synthèse
+
+| Indicateur | Valeur |
+|---|---|
+| Génération réussie (`/api/generate` → `success:true`, code non vide après `cleanCode`) | **10 / 10 = 100 %** |
+| Code valide à la prévisualisation (`/api/preview` → mesh non vide) | **5 / 10 = 50 %** |
+| Itérations réussies | 1 / 2 (le 6 OK, le 9 FAIL — héritage du test 8) |
+| Latence médiane `/api/generate` | ~10 s |
+| Latence min / max `/api/generate` | 2.2 s / 16.1 s |
+
+Codes individuels disponibles à `/tmp/llmcad-phase4/test{1..10}.py`, récap brut JSON à `/tmp/llmcad-phase4/results.json`.
+
+## Points d'attention / écarts
+
+1. **Conflit prompt ⇄ validateur sur `cq.Assembly`** — le nouveau prompt encourage l'usage de `cq.Assembly` + `cq.Location` pour les pièces multi-corps (« Assembly (when multiple parts): … `result = assy` »). Mais `CadQueryValidator.allowed_cq_operations` (phase 3.5, intentionnellement non touché) ne contient **ni** `Assembly` **ni** `Location`. Conséquence : tout prompt qui demande un assemblage de plusieurs pièces (test 8 « enclosure + lid », test 9 par héritage) est généré correctement par le LLM mais rejeté par le validateur. **Décision phase 4 (baseline)** : ne pas corriger — la spec demandait explicitement de produire la baseline sans itérer. Trois pistes possibles en phase 5 :
+    - Retirer la section « Assembly » du prompt et obliger à un seul `cq.Workplane` chaîné par `.union()` (limite la modélisation).
+    - Ajouter `Assembly`, `Location` à `allowed_cq_operations` côté validateur (à arbitrer pour la sécurité — `cq.Location` est juste un constructeur, `cq.Assembly` est un conteneur, pas dangereux en soi).
+    - Filtrer/transformer côté `cleanCode` Node (déconseillé, fragile).
+2. **vLLM instable pendant les tests** — le serveur `192.168.30.121:8000` était inaccessible par intermittence : connexion TCP refusée puis revenue après 60–360 s, plusieurs fois pendant l'exécution. Sur les 5 tests refaits après cycle de panne, **toutes les générations reprises ont fini par réussir** au 1er ou 5ème essai. Le timeout côté Node (30 s, non modifié) ne change pas — c'est bien la disponibilité de vLLM qui était en jeu, pas la latence inhérente du modèle (~3–16 s mesurée quand le serveur répond).
+3. **Variabilité du LLM à `temperature=0.2`** — sur deux appels successifs du test 3 (« L-bracket »), le LLM a produit deux codes différents : un qui validait et générait 64 v / 36 f (premier run), un qui crashe avec « Can not return the Nth element of an empty list » (run final, conservé dans `results.json`). À 0.2 le top-k reste actif et la séquence de tokens diffère selon le contexte (notamment le KV cache de vLLM). Le résultat final reflète donc un échantillon, pas un comportement déterministe — d'où la valeur d'avoir cette baseline avant toute tentative d'amélioration.
+4. **Test 10 fait crasher le serveur Python** — la chaîne d'opérations (extrude, sub-extrude, rarray, fillet) finit par planter le process Python entier (le port 5002 disparaît, redémarrage manuel nécessaire). Aucune trace dans le log Flask, suggérant un crash bas niveau OCC (segfault ou C++ exception non remontée). À investiguer : le timeout de 30 s côté `cadquery/server.py` (phase 3.5) tue le **thread**, pas le process — un crash natif passe outre. Pour un usage réel, il faudrait basculer chaque exécution dans un sous-process (multiprocessing) qu'on peut tuer / qui isole les segfaults.
+5. **Cotation libre** — le LLM ne suit pas les standards ISO. Vis M10×30 (test 7) avec tête plus petite que la tige, vis M8 « bolt holes » modélisées en bossages pleins (test 2). C'est attendu : Qwen3 n'a pas de connaissance dimensionnelle stricte sans données numériques explicites dans le prompt. Pour des cotes normalisées, ajouter un Pattern « ISO threaded fastener proportions » au prompt en phase 5.
+6. **Engrenages reste un point dur** (test 4) — le prompt n'a pas de Pattern dédié. Le LLM tente un involute via `threePointArc` avec des paramètres invalides. Pas de régression par rapport à la phase 3.5, mais pas d'amélioration non plus. Une ligne « do not attempt involute spur gears, prefer simple polygon teeth or use polarArray + tooth profile sketch » dans le prompt résoudrait probablement.
+7. **Aucune modification du frontend, du Node hors `SYSTEM_PROMPT`, du serveur Python ou du validateur** — comme demandé. Le `cleanCode()` continue d'extraire le code d'éventuels code-fences (le nouveau prompt interdit explicitement les fences, mais le strip défensif reste en place ; vérifié sur les 10 tests : aucune génération n'en contenait).
+8. **Pas de retry automatique exploité ici** — les tests appellent directement `/api/preview` après `/api/generate`, sans passer par la logique de retry du frontend (`web/js/chat.js`). En usage réel via le chat, les 5 cas en `FAIL preview` (tests 3, 4, 8, 9, 10) déclencheraient un retry automatique avec le message d'erreur en clair, ce qui pourrait sauver les tests 3 (chaîne `translate` cassée — message explicite) et peut-être 4. Les tests 8 et 9 ne seraient pas sauvés tant que le validateur n'autorise pas Assembly. Le test 10 (socket hang up) déclencherait un retry mais le serveur Python étant crashé, il faudrait un redémarrage manuel.
+9. **Latence acceptable** — ~10 s de médiane est compatible avec l'UX du chat (indicateur de chargement déjà en place phase 3). Le prompt long ne ralentit pas significativement Qwen3 32B FP8 vs un prompt court (mesure directe : 5.6 s avec long prompt vs 9.4 s avec court prompt sur le même test 2 — variabilité serveur dominante).
