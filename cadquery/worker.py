@@ -187,6 +187,9 @@ def _write_json_line(obj: Dict[str, Any]) -> None:
 
 def run_persistent() -> None:
     """Boucle stdin → stdout jusqu'à EOF."""
+    # Signal synchronisé avec WorkerPool._spawn_worker (après imports lourds).
+    sys.stderr.write("WORKER_READY\n")
+    sys.stderr.flush()
     try:
         for raw in sys.stdin:
             raw = raw.strip()

@@ -75,9 +75,20 @@ class WorkerPool:
         )
         print(f"[pool] worker born pid={proc.pid}", flush=True)
 
+        if proc.stderr is None:
+            raise RuntimeError("worker stderr not piped")
+        ready = proc.stderr.readline()
+        if ready.strip() != "WORKER_READY":
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait(timeout=2)
+            raise RuntimeError(
+                f"worker pid={proc.pid} missing WORKER_READY: {ready!r}"
+            )
+
         def drain_stderr() -> None:
-            if proc.stderr is None:
-                return
             try:
                 for line in iter(proc.stderr.readline, ""):
                     if line:
