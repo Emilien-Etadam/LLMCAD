@@ -8,7 +8,7 @@ Web-based [Build123d](https://github.com/gumyr/build123d) editor with a three.js
 
 Two processes on the same host:
 
-- **Node.js** (`node/server.js`) — listens on `0.0.0.0:49157`. Serves the static frontend from `web/` and exposes the API under `/api/{preview,stl,step,generate}`. Forwards API requests to the Python server.
+- **Node.js** (`node/server.js`) — listens on `0.0.0.0:49157`. Serves the static frontend from `web/` and exposes the API under `/api/{preview,stl,step,agent}`. Forwards CAD execution requests to the Python server.
 - **Python / Build123d** (`cadquery/server.py`) — listens on `127.0.0.1:5002` (loopback only). A **pool of persistent** `worker.py --persistent` processes handles `/preview`, `/stl`, and `/step` (see phase 6 in `STATUS.md`). The historical `cadquery/` directory name is preserved for git history; the engine inside is build123d.
 
 ```
@@ -111,7 +111,7 @@ Then `sudo systemctl daemon-reload && sudo systemctl enable --now llmcad`.
 ## Operation
 
 - The frontend (`web/`) is HTML/CSS/JavaScript that allows Build123d code to be input, shows the current 3D model (coarse) with [three.js](https://github.com/mrdoob/three.js/), and lets you download STL/STEP exports.
-- The Node server handles requests from the user (preview / STL / STEP / generate) and queues them to avoid concurrent geometry executions.
+- The Node server handles requests from the user (preview / STL / STEP / agent) and queues CAD execution calls to avoid concurrent geometry executions.
 - The Python server keeps a **pool** of persistent worker processes (`cadquery/worker.py --persistent`). Each worker loads build123d once, applies an `RLIMIT_AS` cap (4 GiB by default; override via `CADQUERY_WORKER_MEM_LIMIT_MB`), and runs user code in a **fresh copied namespace** every request. Requests use `WORKER_REQUEST_TIMEOUT` (fallback `CADQUERY_EXEC_TIMEOUT`). Native crashes (segfaults in OpenCascade, out-of-memory) only kill that worker; Flask stays up and the pool replaces the process.
 
   The user script must assign its 3D result to `result` (a `Part`, `Compound`, or `Solid`). The worker preloads `from build123d import *` so common constructors (`Box`, `Cylinder`, `fillet`, `extrude`, `Pos`, `Axis`, ...) are available without an explicit import.
@@ -128,9 +128,22 @@ This is sufficient for **local-only** deployments (loopback bind, single-user). 
 - Loosely based on [replicad](https://github.com/sgenoud/replicad) but using Build123d / OpenCascade instead of [OpenCascade.js](https://ocjs.org/).
 - Pull requests are very welcome.
 
+## Agent IA (phase 7)
+
+- The legacy one-shot path (`/api/generate` + `web/js/chat.js`) has been removed.
+- The only generation path is now the agentic loop exposed at `POST /api/agent` (SSE stream).
+- Frontend uses `web/js/agent.js` and displays iterations, extracted code, execution errors, and final success.
+
+Example CLI call:
+
+```bash
+curl -N -X POST "http://127.0.0.1:49157/api/agent" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"boîte 10x10x10"}'
+```
+
 ## Future Work
 
-- vLLM client + agentic loop — phase 7.
 - Geometric tool calling — phase 8.
 
 ## License

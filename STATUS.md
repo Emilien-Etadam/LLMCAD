@@ -1,6 +1,7 @@
 # STATUS
 
 Index :
+- [Phase 7 — Agent loop SSE + nettoyage legacy](#phase-7--agent-loop-sse--nettoyage-legacy) ← le plus récent
 - [Phase 6 — Worker pool persistant](#phase-6--worker-pool-persistant) ← le plus récent
 - [Phase 5 — Migration Build123d](#phase-5--migration-cadquery--build123d)
 - Phase 4.5 — Isolation subprocess + Assembly support
@@ -8,6 +9,34 @@ Index :
 - Phase 3.5 — Sandbox extension (functions/loops/comprehensions)
 - Phase 2 — Génération CadQuery par LLM (vLLM)
 - Phase 1 — Migration Docker → Bare metal
+
+---
+
+# Phase 7 — Agent loop SSE + nettoyage legacy
+
+Date : 2026-04-30  
+Tag : `v0.7.0-agent-loop`
+
+## Résumé
+
+La génération LLM passe désormais uniquement par un agent itératif `CADAgent` exposé en `POST /api/agent` avec streaming SSE (`iteration_start`, `llm_token`, `code_extracted`, `execution_*`, `final_*`).
+
+Le chemin mono-shot legacy a été supprimé :
+
+- route `POST /api/generate` retirée de `node/server.js`
+- helper `generateCadQuery` retiré de `node/llm.js`
+- UI chat legacy retirée (`web/js/chat.js`, `web/css/chat.css`, panneau HTML associé)
+
+Le frontend conserve uniquement le panneau Agent (`web/js/agent.js`) et l’UI principale éditeur/viewer.
+
+## Vérifications phase 7
+
+- Sanité code: `generateCadQuery` absent du repo.
+- Sanité routes: `/api/generate` absent du code runtime (références historiques conservées ici dans `STATUS.md`).
+- Sanité frontend: plus de `chat-panel`/`chat-*` dans `web/`.
+- Runtime: `./start.sh` OK, `GET /test` + `GET /health` = 200.
+- Régression phase 6: `/api/preview`, `/api/stl`, `/api/step` répondent 200.
+- E2E agent: prompt `boîte 10x10x10` -> événement SSE `final_success` + preview.
 
 ---
 
