@@ -4,23 +4,24 @@
   <title>LLMCAD</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="stylesheet" href="main.css">
-  <link rel="stylesheet" href="css/chat.css">
   <link rel="icon" type="image/png" sizes="192x192" href="favicon/favicon-192x192.png">
   <link rel="icon" type="image/x-icon" href="favicon/favicon.ico">
 </head>
 <body>
   <div class="container">
 
-    <aside class="panel chat-panel" id="chat-panel">
+    <aside class="panel agent-sidebar" id="agent-sidebar">
       <header class="panel-header">
-        <h2>Chat LLM</h2>
-        <button class="new-chat-btn" id="new-chat-btn" title="Vide l'historique, l'éditeur et le viewer">+ Nouveau chat</button>
+        <h2>Agent IA</h2>
       </header>
-      <div class="chat-thread" id="chat-thread"></div>
-      <div class="chat-input-area">
-        <textarea id="chat-input" rows="3" placeholder="Décrivez la pièce à générer (Ctrl+Enter pour envoyer)..."></textarea>
-        <button class="send-btn" id="chat-send">Envoyer</button>
-      </div>
+      <section class="agent-panel" id="agent-panel">
+        <h3>Agent</h3>
+        <textarea id="agent-prompt" rows="3" placeholder="Ex: crée une boîte de 50x30x10 avec un congé de 2mm"></textarea>
+        <button class="send-btn" id="agent-generate-btn">Générer</button>
+        <div id="agent-status"></div>
+        <div id="agent-iterations" class="agent-iterations"></div>
+        <button class="send-btn" id="agent-load-code-btn" disabled>Charger ce code dans l'éditeur</button>
+      </section>
     </aside>
 
     <div class="resizer" id="resizer-1" title="Glisser pour redimensionner"></div>
@@ -52,6 +53,6 @@
   </div>
   <script type="module" src="models.js"></script>
   <script type="module" src="main.js"></script>
-  <script type="module" src="js/chat.js"></script>
+  <script type="module" src="js/agent.js"></script>
 </body>
 </html>

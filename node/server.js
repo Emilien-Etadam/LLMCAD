@@ -12,7 +12,7 @@ const express = require('express');
 const rate_limit = require('express-rate-limit');
 const cors = require('cors');
 const RequestQueue = require('./RequestQueue');
-const { generateCadQuery, VLLM_URL, VLLM_MODEL } = require('./llm');
+const { CADAgent, VLLM_URL, VLLM_MODEL } = require('./llm');
 
 const NODE_HOST = process.env.NODE_HOST || '0.0.0.0';
 const NODE_PORT = parseInt(process.env.NODE_PORT || '49157', 10);
@@ -69,47 +69,48 @@ async function appendRequestLog(timestamp, fields) {
   }
 }
 
-app.post('/api/generate', limiter, async (req, res) => {
-  const timestamp = new Date().toISOString();
+app.post('/api/agent', limiter, async (req, res) => {
   const body = req.body || {};
   const prompt = typeof body.prompt === 'string' ? body.prompt : '';
-  const history = Array.isArray(body.history) ? body.history : [];
-  const currentCode = typeof body.currentCode === 'string' ? body.currentCode : '';
-  const ip = req.headers['x-real-ip'] || req.ip;
-
-  await appendRequestLog(timestamp, {
-    endpoint: 'generate',
-    prompt,
-    history_len: history.length,
-    current_code_len: currentCode.length,
-    ip
-  });
-
-  if (!prompt || prompt.trim().length === 0) {
-    return res.status(400).json({ success: false, error: 'Missing or empty "prompt"' });
+  if (!prompt) {
+    return res.status(400).json({ error: 'prompt manquant' });
   }
 
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const maxIterations = parseInt(process.env.AGENT_MAX_ITERATIONS || '5', 10);
+  const requestTimeout = parseInt(process.env.AGENT_REQUEST_TIMEOUT_MS || '30000', 10);
+  const cadServerUrl = process.env.CAD_SERVER_URL || `http://${process.env.CADQUERY_HOST || '127.0.0.1'}:${process.env.CADQUERY_PORT || '5002'}`;
+
+  const agent = new CADAgent({
+    vllmBaseUrl: process.env.VLLM_BASE_URL || process.env.VLLM_URL,
+    model: process.env.VLLM_MODEL,
+    cadServerUrl,
+    maxIterations,
+    requestTimeout
+  });
+
+  const writeSSE = (event) => {
+    res.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
+
   try {
-    const code = await generateCadQuery(prompt, history, currentCode);
-    await appendRequestLog(new Date().toISOString(), {
-      endpoint: 'generate-result',
-      ok: true,
-      code_len: code.length,
-      ip
+    for await (const event of agent.run(prompt)) {
+      writeSSE(event);
+    }
+  } catch (err) {
+    const status = String(err && err.status || '');
+    const isTimeout = err && (err.name === 'AbortError' || status === '408' || status === '504');
+    writeSSE({
+      type: 'fatal_error',
+      error: err && err.message ? err.message : String(err),
+      reason: isTimeout ? 'timeout' : 'internal_error'
     });
-    return res.json({ success: true, code });
-  } catch (error) {
-    const status = error.status || 500;
-    const message = error.message || 'LLM generation failed';
-    console.log('[ERROR][generate] ', message);
-    await appendRequestLog(new Date().toISOString(), {
-      endpoint: 'generate-result',
-      ok: false,
-      status,
-      error: message,
-      ip
-    });
-    return res.status(status).json({ success: false, error: message });
+  } finally {
+    res.end();
   }
 });
 

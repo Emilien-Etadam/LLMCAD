@@ -38,7 +38,7 @@ body, html {
   min-width: 0;
 }
 
-.chat-panel {
+.agent-sidebar {
   flex: 0 0 30%;
   min-width: 260px;
   background: var(--bg-mid);
@@ -219,6 +219,79 @@ body, html {
   pointer-events: none;
 }
 
+.agent-panel {
+  border-top: 1px solid var(--border);
+  padding: 10px 12px;
+  background: var(--bg-dark);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-panel h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+#agent-prompt {
+  resize: vertical;
+  min-height: 52px;
+  background: var(--bg-light);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px;
+}
+
+#agent-status {
+  min-height: 20px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.agent-iterations {
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agent-iteration {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-mid);
+}
+
+.agent-iteration summary {
+  cursor: pointer;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.agent-iteration-body {
+  padding: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.agent-code {
+  margin: 0;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #1c1c1c;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px;
+}
+
+.agent-error {
+  color: #ff9a9a;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
 /* Responsive: < 1200px → vertical stack */
 @media screen and (max-width: 1200px) {
   body, html {
@@ -237,7 +310,7 @@ body, html {
     min-width: unset;
   }
 
-  .chat-panel {
+  .agent-sidebar {
     height: 50vh;
     min-height: 320px;
   }

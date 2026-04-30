@@ -1,302 +1,252 @@
 /// @file llm.js
-/// @brief vLLM (OpenAI-compatible) client for CadQuery code generation
-/// @author LLMCAD
+/// @brief vLLM (OpenAI-compatible) helpers + agentic Build123d loop
 
-const axios = require('axios');
+const OpenAI = require('openai');
 
-const VLLM_URL = (process.env.VLLM_URL || 'http://192.168.30.121:8000/v1').replace(/\/+$/, '');
-const VLLM_MODEL = process.env.VLLM_MODEL || 'Qwen/Qwen2.5-Coder-32B-Instruct';
-const VLLM_API_KEY = process.env.VLLM_API_KEY || '';
-const VLLM_TIMEOUT_MS = 30000;
+const VLLM_BASE_URL = (process.env.VLLM_BASE_URL || process.env.VLLM_URL || 'http://192.168.30.121:8000/v1').replace(/\/+$/, '');
+const VLLM_MODEL = process.env.VLLM_MODEL || '/data/models/qwen3-32b-fp8';
+const VLLM_API_KEY = process.env.VLLM_API_KEY || 'EMPTY';
+const AGENT_MAX_ITERATIONS = parseInt(process.env.AGENT_MAX_ITERATIONS || '5', 10);
+const AGENT_REQUEST_TIMEOUT_MS = parseInt(process.env.AGENT_REQUEST_TIMEOUT_MS || '30000', 10);
 
-const SYSTEM_PROMPT = `You are a CadQuery code generator. You output ONLY valid Python code. No explanations, no markdown, no code fences, no comments unless they clarify complex geometry logic.
+const CADQUERY_HOST = process.env.CADQUERY_HOST || '127.0.0.1';
+const CADQUERY_PORT = parseInt(process.env.CADQUERY_PORT || '5002', 10);
+const CAD_SERVER_URL = process.env.CAD_SERVER_URL || `http://${CADQUERY_HOST}:${CADQUERY_PORT}`;
 
-HARD RULES:
-- Always start with: import cadquery as cq
-- You may also import math and typing if needed. No other imports.
-- The final 3D object MUST be assigned to a variable named "result"
-- Never use show_object(), cq.exporters, or any display/export function
-- Never use eval(), exec(), open(), os, sys, subprocess, or any system call
-- Never access dunder attributes (__class__, __bases__, __import__, etc.)
-- If the user provides existing code and asks for a modification, return the FULL modified code, not a diff or partial snippet
+const SYSTEM_PROMPT = `Tu es un assistant CAO expert en Build123d (Python).
 
-CADQUERY API REFERENCE (use only these):
+Génère UNIQUEMENT du code Python valide qui :
+- Importe avec: from build123d import *
+- Termine TOUJOURS par une variable nommée "result" de type Part, Compound, ou Solid
+- Utilise le mode algébrique (operators +/-/*) plutôt que les Builder contexts
+- N'imprime rien, ne lit aucun fichier, ne fait aucun import autre que build123d
 
-Workplane creation:
-  cq.Workplane("XY" | "XZ" | "YZ")
-  .transformed(offset=(x,y,z), rotate=(rx,ry,rz))
+Format de réponse OBLIGATOIRE :
+\`\`\`python
+from build123d import *
 
-2D Primitives (on workplane):
-  .rect(xLen, yLen, centered=True)
-  .circle(radius)
-  .ellipse(x_radius, y_radius)
-  .polygon(nSides, diameter)
-  .slot2D(length, diameter, angle=0)
-  .text(txt, fontsize, distance, cut=True/False, font="Arial")
+# ton code ici
+result = ...
+\`\`\`
 
-2D Drawing:
-  .moveTo(x, y)
-  .lineTo(x, y)
-  .line(dx, dy)
-  .hLine(distance), .vLine(distance)
-  .hLineTo(x), .vLineTo(y)
-  .threePointArc(p1, p2)
-  .sagittaArc(endPoint, sag)
-  .radiusArc(endPoint, radius)
-  .tangentArcPoint(endpoint)
-  .spline(listOfXYTuple)
-  .polyline(listOfXYTuple)
-  .close()
-  .mirrorX(), .mirrorY()
-  .offset2D(distance)
-  .wire()
+Aucun texte avant ou après le bloc de code.
 
-3D Operations:
-  .extrude(distance, combine=True, both=False)
-  .revolve(angleDegrees=360, axisStart=(0,0,0), axisEnd=(0,1,0))
-  .sweep(path, multisection=False)
-  .loft(ruled=False)
-  .shell(thickness) — hollows the solid
-  .cut(other) — boolean subtract
-  .union(other) — boolean add
-  .intersect(other) — boolean intersect
-  .hole(diameter, depth=None)
-  .cboreHole(diameter, cboreDiameter, cboreDepth, depth=None)
-  .cskHole(diameter, cskDiameter, cskAngle, depth=None)
+Exemples corrects :
 
-Transforms:
-  .translate((x, y, z))
-  .rotateAboutCenter((ax, ay, az), angleDegrees)
-  .rotate((0,0,0), (0,0,1), angleDegrees)
-  .mirror("XY" | "XZ" | "YZ")
+Demande: "boîte 50x30x10 avec congé 2mm"
+Réponse:
+\`\`\`python
+from build123d import *
 
-Edge/Face Operations:
-  .edges(selector) — e.g. "|Z", ">Z", "<Z"
-  .faces(selector) — e.g. ">Z", "<X", "+Y"
-  .fillet(radius)
-  .chamfer(length)
-  .workplane(offset=0)
+result = Box(50, 30, 10)
+result = fillet(result.edges(), radius=2)
+\`\`\`
 
-Selectors (string):
-  ">X", "<X", ">Y", "<Y", ">Z", "<Z" — max/min along axis
-  "|X", "|Y", "|Z" — parallel to axis
-  "#X", "#Y", "#Z" — perpendicular to axis
-  "not(<selector>)" — negate
-  ">Z[-2]" — second from top
-  Combine with and/or: ">Z and |X"
+Demande: "tube creux extérieur 20mm intérieur 15mm hauteur 40mm"
+Réponse:
+\`\`\`python
+from build123d import *
 
-Patterns:
-  .rarray(xSpacing, ySpacing, xCount, yCount) — rectangular array of points
-  .polarArray(radius, startAngle, angle, count) — polar array of points
-  .pushPoints([(x1,y1), (x2,y2), ...]) — arbitrary point array
+result = Cylinder(radius=10, height=40) - Cylinder(radius=7.5, height=40)
+\`\`\`
 
-Workplane chaining:
-  .faces(">Z").workplane() — new workplane on top face
-  .faces("<Z").workplane() — new workplane on bottom face
-  .center(x, y) — shift workplane origin
+Demande: "plaque 100x60x5 avec 4 trous traversants diamètre 6 aux coins, marge 10mm"
+Réponse:
+\`\`\`python
+from build123d import *
 
-Assembly (when multiple parts):
-  assy = cq.Assembly()
-  assy.add(part, name="name", loc=cq.Location((x,y,z), (rx,ry,rz)))
-  result = assy
+plate = Box(100, 60, 5)
+holes = Compound([
+    Pos(40, 20, 0) * Cylinder(radius=3, height=5),
+    Pos(-40, 20, 0) * Cylinder(radius=3, height=5),
+    Pos(40, -20, 0) * Cylinder(radius=3, height=5),
+    Pos(-40, -20, 0) * Cylinder(radius=3, height=5),
+])
+result = plate - holes
+\`\`\`
 
-MODELING PATTERNS:
-
-Pattern 1 — Base with pocket:
-  result = (cq.Workplane("XY").rect(100,60).extrude(20)
-    .faces(">Z").workplane().rect(80,40).cutBlind(-15))
-
-Pattern 2 — Bolt hole pattern:
-  result = (cq.Workplane("XY").circle(50).extrude(10)
-    .faces(">Z").workplane()
-    .polarArray(35, 0, 360, 8).hole(5))
-
-Pattern 3 — Profile extrusion:
-  result = (cq.Workplane("XY")
-    .moveTo(0,0).lineTo(50,0).lineTo(50,10)
-    .lineTo(30,10).lineTo(30,40).lineTo(20,40)
-    .lineTo(20,10).lineTo(0,10).close()
-    .extrude(80))
-
-Pattern 4 — Revolution:
-  result = (cq.Workplane("XZ")
-    .moveTo(10,0).lineTo(20,0).lineTo(20,50)
-    .lineTo(15,55).lineTo(10,55).close()
-    .revolve(360, (0,0,0), (0,1,0)))
-
-Pattern 5 — Parametric with loops:
-  import math
-  result = cq.Workplane("XY").circle(50).extrude(5)
-  for i in range(8):
-      a = math.radians(i * 45)
-      result = result.cut(
-          cq.Workplane("XY")
-          .center(35 * math.cos(a), 35 * math.sin(a))
-          .circle(6).extrude(5))
-
-COMMON MISTAKES TO AVOID:
-- Do not chain .hole() after .edges().fillet() — do fillet last or use .faces(">Z").workplane() before .hole()
-- Do not use .extrude() on a 3D object — it works on 2D wire/face only
-- Do not forget .close() when drawing a profile with lineTo/line
-- .shell() removes a face first; call it on the solid, not on a workplane
-- .fillet() radius must be less than half the smallest edge length
-- When cutting holes in a pattern, .pushPoints() or loops are more reliable than .rarray() for non-grid layouts
-- For assemblies, each part must be a separate cq.Workplane chain, then added to cq.Assembly
-
-OUTPUT FORMAT:
-Return the complete Python script ready to execute. Start with imports, define any helper functions, then build the geometry, and end with the result assignment. Nothing else.`;
+Si on te donne une erreur d'exécution, corrige le code en gardant la même intention.
+Réponds avec le code corrigé, toujours dans le même format.`;
 
 /**
- * Strip markdown code fences and any preamble before the first cadquery import.
- * The system prompt forbids fences, but some models still emit them.
+ * @param {string} text
+ * @returns {string|null}
  */
-function cleanCode(raw) {
-  if (typeof raw !== 'string') return '';
-  let code = raw.trim();
-
-  const fenceMatch = code.match(/```(?:python|py)?\s*\n?([\s\S]*?)\n?```/i);
-  if (fenceMatch) {
-    code = fenceMatch[1].trim();
-  } else {
-    code = code.replace(/^```(?:python|py)?\s*\n?/i, '');
-    code = code.replace(/\n?```\s*$/i, '');
-    code = code.trim();
-  }
-
-  const importIdx = code.search(/^\s*import\s+cadquery\b/m);
-  if (importIdx > 0) {
-    code = code.slice(importIdx);
-  } else if (importIdx === -1) {
-    const fromIdx = code.search(/^\s*from\s+cadquery\b/m);
-    if (fromIdx > 0) {
-      code = code.slice(fromIdx);
-    }
-  }
-
-  // The Python sandbox (cadquery/server.py) pre-injects `cq`, `np`, `math` and
-  // strips `__import__` from builtins. A literal `import cadquery as cq` therefore
-  // raises "__import__ not found" at runtime. The system prompt still instructs
-  // the model to write the import for human readability/portability, but we strip
-  // any top-level cadquery import lines before returning the code to the client.
-  code = code
-    .split('\n')
-    .filter(line => !/^\s*import\s+cadquery(\s+as\s+\w+)?\s*(#.*)?$/.test(line)
-                 && !/^\s*from\s+cadquery(\.[\w.]+)?\s+import\s+/.test(line))
-    .join('\n');
-
-  return code.trim();
+function extractPythonCode(text) {
+  if (typeof text !== 'string') return null;
+  const match = text.match(/```python\s*\n([\s\S]*?)\n```/i);
+  return match ? match[1].trim() : null;
 }
 
 /**
- * Build the chat-completions message array.
- *
- * Layout:
- *   [0]            system prompt
- *   [1..n-2]       prior conversation history (alternating user/assistant)
- *   [n-1] (opt.)   user message containing currentCode
- *   [n]            new user prompt
+ * @param {number} ms
+ * @returns {AbortController}
  */
-function buildMessages(prompt, history, currentCode) {
-  const messages = [{ role: 'system', content: SYSTEM_PROMPT }];
+function buildTimeoutController(ms) {
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(new Error(`timeout_after_${ms}ms`)), ms);
+  return controller;
+}
 
-  if (Array.isArray(history)) {
-    for (const m of history) {
-      if (!m || typeof m !== 'object') continue;
-      const role = m.role;
-      const content = typeof m.content === 'string' ? m.content : '';
-      if ((role === 'user' || role === 'assistant') && content.length > 0) {
-        messages.push({ role, content });
-      }
-    }
-  }
+/**
+ * @param {string} message
+ * @returns {{error: string, traceback: string}}
+ */
+function splitErrorAndTraceback(message) {
+  const raw = typeof message === 'string' ? message : String(message || '');
+  const lines = raw.split('\n');
+  const error = lines[0] || 'Execution error';
+  const traceback = lines.slice(1).join('\n').trim();
+  return { error, traceback };
+}
 
-  if (typeof currentCode === 'string' && currentCode.trim().length > 0) {
-    messages.push({
-      role: 'user',
-      content: `Current CadQuery code:\n\`\`\`python\n${currentCode}\n\`\`\``
+/**
+ * @typedef {Object} PreviewSuccess
+ * @property {true} ok
+ * @property {{vertices:number[], faces:number[], objectCount?:number}} preview
+ *
+ * @typedef {Object} PreviewError
+ * @property {false} ok
+ * @property {string} error
+ * @property {string} traceback
+ */
+
+class CADAgent {
+  /**
+   * @param {{
+   *  vllmBaseUrl?: string,
+   *  model?: string,
+   *  cadServerUrl?: string,
+   *  maxIterations?: number,
+   *  requestTimeout?: number
+   * }} opts
+   */
+  constructor(opts = {}) {
+    this.vllmBaseUrl = (opts.vllmBaseUrl || VLLM_BASE_URL).replace(/\/+$/, '');
+    this.model = opts.model || VLLM_MODEL;
+    this.cadServerUrl = (opts.cadServerUrl || CAD_SERVER_URL).replace(/\/+$/, '');
+    this.maxIterations = opts.maxIterations || AGENT_MAX_ITERATIONS;
+    this.requestTimeout = opts.requestTimeout || AGENT_REQUEST_TIMEOUT_MS;
+    this.client = new OpenAI({
+      apiKey: VLLM_API_KEY,
+      baseURL: this.vllmBaseUrl,
+      timeout: this.requestTimeout
     });
   }
 
-  messages.push({ role: 'user', content: String(prompt || '') });
-  return messages;
-}
+  /**
+   * @param {string} code
+   * @returns {Promise<PreviewSuccess|PreviewError>}
+   */
+  async executePreview(code) {
+    const controller = buildTimeoutController(this.requestTimeout);
+    let response;
+    try {
+      response = await fetch(`${this.cadServerUrl}/preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+        signal: controller.signal
+      });
+    } catch (err) {
+      return { ok: false, error: `preview_request_failed: ${err.message}`, traceback: '' };
+    }
 
-/**
- * Call the remote vLLM server and return cleaned CadQuery code.
- * @throws {Error} on network/timeout/HTTP failures, or empty model output.
- */
-async function generateCadQuery(prompt, history, currentCode) {
-  if (typeof prompt !== 'string' || prompt.trim().length === 0) {
-    const err = new Error('Prompt must be a non-empty string');
-    err.status = 400;
-    throw err;
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (_err) {
+      payload = null;
+    }
+
+    if (response.ok && payload && payload.data && payload.data !== 'None') {
+      return { ok: true, preview: payload.data };
+    }
+    const composed = payload && payload.message ? payload.message : `preview_http_${response.status}`;
+    const parsed = splitErrorAndTraceback(composed);
+    return { ok: false, error: parsed.error, traceback: parsed.traceback };
   }
 
-  const messages = buildMessages(prompt, history, currentCode);
+  /**
+   * @param {string} userPrompt
+   */
+  async *run(userPrompt) {
+    const messages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: userPrompt }
+    ];
 
-  const headers = { 'Content-Type': 'application/json' };
-  if (VLLM_API_KEY) headers.Authorization = `Bearer ${VLLM_API_KEY}`;
+    let totalPromptTokens = 0;
+    let totalCompletionTokens = 0;
+    let lastError = '';
 
-  let response;
-  try {
-    response = await axios.post(
-      `${VLLM_URL}/chat/completions`,
-      {
-        model: VLLM_MODEL,
+    for (let n = 1; n <= this.maxIterations; n += 1) {
+      yield { type: 'iteration_start', n };
+
+      let fullResponse = '';
+      let usage = null;
+      const stream = await this.client.chat.completions.create({
+        model: this.model,
         messages,
+        stream: true,
+        stream_options: { include_usage: true },
         temperature: 0.2,
-        max_tokens: 4096,
-        stream: false,
-        // Qwen3-specific: disable the chain-of-thought "thinking" channel so the
-        // assistant's content field directly contains the requested code. The
-        // server silently ignores this for chat templates that don't use it.
-        chat_template_kwargs: { enable_thinking: false }
-      },
-      {
-        timeout: VLLM_TIMEOUT_MS,
-        headers
+        max_tokens: 1024
+      });
+
+      for await (const chunk of stream) {
+        const token = chunk.choices[0]?.delta?.content || '';
+        if (token) {
+          fullResponse += token;
+          yield { type: 'llm_token', token };
+        }
+        if (chunk.usage) usage = chunk.usage;
       }
-    );
-  } catch (err) {
-    if (err.code === 'ECONNABORTED') {
-      const e = new Error(`vLLM request timed out after ${VLLM_TIMEOUT_MS}ms (${VLLM_URL})`);
-      e.status = 504;
-      throw e;
-    }
-    if (err.response) {
-      const detail = err.response.data && (err.response.data.error?.message || err.response.data.message)
-        || JSON.stringify(err.response.data);
-      const e = new Error(`vLLM HTTP ${err.response.status}: ${detail}`);
-      e.status = 502;
-      throw e;
-    }
-    const e = new Error(`vLLM network error (${VLLM_URL}): ${err.message}`);
-    e.status = 502;
-    throw e;
-  }
 
-  const content = response.data?.choices?.[0]?.message?.content;
-  if (typeof content !== 'string' || content.trim().length === 0) {
-    const e = new Error('vLLM returned empty content');
-    e.status = 502;
-    throw e;
-  }
+      if (usage) {
+        totalPromptTokens += usage.prompt_tokens || 0;
+        totalCompletionTokens += usage.completion_tokens || 0;
+      }
+      console.log(
+        `[agent] iter=${n} tokens prompt=${usage?.prompt_tokens ?? 0} completion=${usage?.completion_tokens ?? 0} total_prompt=${totalPromptTokens} total_completion=${totalCompletionTokens} grand_total=${totalPromptTokens + totalCompletionTokens}`
+      );
 
-  const code = cleanCode(content);
-  if (code.length === 0) {
-    const e = new Error('vLLM response did not contain valid code after cleanup');
-    e.status = 502;
-    throw e;
+      const code = extractPythonCode(fullResponse);
+      if (!code) {
+        lastError = 'Code Python non trouvé dans la réponse';
+        yield { type: 'execution_error', error: lastError, traceback: '' };
+        messages.push({ role: 'assistant', content: fullResponse });
+        messages.push({ role: 'user', content: "Tu n'as pas inclus de bloc ```python ... ```. Recommence." });
+        continue;
+      }
+
+      yield { type: 'code_extracted', code };
+      yield { type: 'execution_start' };
+
+      const result = await this.executePreview(code);
+      if (result.ok) {
+        yield { type: 'execution_success', preview: result.preview };
+        yield { type: 'final_success', code, preview: result.preview };
+        return;
+      }
+
+      lastError = result.error;
+      yield { type: 'execution_error', error: result.error, traceback: result.traceback };
+      messages.push({ role: 'assistant', content: fullResponse });
+      messages.push({
+        role: 'user',
+        content: `Le code a planté.\n\nErreur: ${result.error}\n\nTraceback:\n${result.traceback}\n\nCorrige le code.`
+      });
+    }
+
+    yield { type: 'final_failure', reason: 'max_iterations', lastError: lastError || 'epuise' };
   }
-  return code;
 }
 
 module.exports = {
-  generateCadQuery,
-  cleanCode,
-  buildMessages,
+  CADAgent,
+  extractPythonCode,
   SYSTEM_PROMPT,
-  VLLM_URL,
-  VLLM_MODEL,
-  VLLM_API_KEY_SET: VLLM_API_KEY.length > 0
+  VLLM_URL: VLLM_BASE_URL,
+  VLLM_MODEL
 };

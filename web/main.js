@@ -90,8 +90,7 @@ let currentModel = null;
 
 /**
  * Send the textarea contents to /api/preview, render the resulting mesh,
- * and update the output panel. Returns {success, message} so callers
- * (chat.js) can branch on success/failure.
+ * and update the output panel. Returns {success, message}.
  */
 export async function runPreview() {
   const preview_button = document.getElementById('preview-btn');
@@ -152,7 +151,7 @@ export async function runPreview() {
 
 /**
  * Drop the current mesh, reset the grid + camera to defaults, hide the
- * output panel. Used by the chat panel's "New chat" button.
+ * output panel.
  */
 export function clearViewer() {
   if (currentModel) {
@@ -232,11 +231,11 @@ ro.observe(viewerContainer);
 
 // --- Resizable panels ---
 //
-// resizer-1 splits chat ↔ editor: their pixel widths swap (sum preserved).
+// resizer-1 splits agent sidebar ↔ editor: their pixel widths swap (sum preserved).
 // resizer-2 splits editor ↔ viewer: same logic.
 // On window resize we leave whatever the user picked alone (>=1200px viewport).
 function setupResizers() {
-  const chatPanel = document.getElementById('chat-panel');
+  const agentSidebar = document.getElementById('agent-sidebar');
   const editorPanel = document.getElementById('editor-panel');
   const viewerPanel = document.getElementById('viewer-panel');
   const r1 = document.getElementById('resizer-1');
@@ -245,16 +244,16 @@ function setupResizers() {
 
   let dragging = null;
   let startX = 0;
-  let startChat = 0, startEditor = 0, startViewer = 0;
+  let startSidebar = 0, startEditor = 0, startViewer = 0;
 
   const onMove = (e) => {
     if (!dragging) return;
     const dx = e.clientX - startX;
     if (dragging === 'r1') {
-      const total = startChat + startEditor;
-      const newChat = Math.max(MIN, Math.min(total - MIN, startChat + dx));
-      const newEditor = total - newChat;
-      chatPanel.style.flex = `0 0 ${newChat}px`;
+      const total = startSidebar + startEditor;
+      const newSidebar = Math.max(MIN, Math.min(total - MIN, startSidebar + dx));
+      const newEditor = total - newSidebar;
+      agentSidebar.style.flex = `0 0 ${newSidebar}px`;
       editorPanel.style.flex = `0 0 ${newEditor}px`;
     } else if (dragging === 'r2') {
       const total = startEditor + startViewer;
@@ -280,7 +279,7 @@ function setupResizers() {
     if (e.button !== 0) return;
     dragging = which;
     startX = e.clientX;
-    startChat = chatPanel.getBoundingClientRect().width;
+    startSidebar = agentSidebar.getBoundingClientRect().width;
     startEditor = editorPanel.getBoundingClientRect().width;
     startViewer = viewerPanel.getBoundingClientRect().width;
     resizerEl.classList.add('resizing');
