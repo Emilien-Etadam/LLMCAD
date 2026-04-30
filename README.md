@@ -9,12 +9,12 @@ Web-based [Build123d](https://github.com/gumyr/build123d) editor with a three.js
 Two processes on the same host:
 
 - **Node.js** (`node/server.js`) — listens on `0.0.0.0:49157`. Serves the static frontend from `web/` and exposes the API under `/api/{preview,stl,step,generate}`. Forwards API requests to the Python server.
-- **Python / Build123d** (`cadquery/server.py`) — listens on `127.0.0.1:5002` (loopback only). Spawns a fresh `worker.py` subprocess per request to tessellate for preview and export STL/STEP. The historical `cadquery/` directory name is preserved for git history; the engine inside is build123d.
+- **Python / Build123d** (`cadquery/server.py`) — listens on `127.0.0.1:5002` (loopback only). A **pool of persistent** `worker.py --persistent` processes handles `/preview`, `/stl`, and `/step` (see phase 6 in `STATUS.md`). The historical `cadquery/` directory name is preserved for git history; the engine inside is build123d.
 
 ```
 Browser  ──HTTP──▶  Node :49157 ──HTTP──▶  Python/Build123d :5002
                        │                     │
-                       │                     └── per-request worker.py subprocess
+                       │                     └── persistent worker.py pool
                        └── serves web/ (HTML/JS/CSS)
 ```
 
@@ -112,7 +112,7 @@ Then `sudo systemctl daemon-reload && sudo systemctl enable --now llmcad`.
 
 - The frontend (`web/`) is HTML/CSS/JavaScript that allows Build123d code to be input, shows the current 3D model (coarse) with [three.js](https://github.com/mrdoob/three.js/), and lets you download STL/STEP exports.
 - The Node server handles requests from the user (preview / STL / STEP / generate) and queues them to avoid concurrent geometry executions.
-- The Python server spawns a fresh subprocess (`cadquery/worker.py`) for each `/preview`, `/stl`, and `/step` request. The worker imports build123d, applies an `RLIMIT_AS` cap (4 GiB by default; override via `CADQUERY_WORKER_MEM_LIMIT_MB`), `exec()`s the user code, and writes the output. A 30 s wall-clock timeout (`CADQUERY_EXEC_TIMEOUT`) lives in the parent. Native crashes (segfaults in OpenCascade, out-of-memory) only kill the worker; the parent Flask server stays up.
+- The Python server keeps a **pool** of persistent worker processes (`cadquery/worker.py --persistent`). Each worker loads build123d once, applies an `RLIMIT_AS` cap (4 GiB by default; override via `CADQUERY_WORKER_MEM_LIMIT_MB`), and runs user code in a **fresh copied namespace** every request. Requests use `WORKER_REQUEST_TIMEOUT` (fallback `CADQUERY_EXEC_TIMEOUT`). Native crashes (segfaults in OpenCascade, out-of-memory) only kill that worker; Flask stays up and the pool replaces the process.
 
   The user script must assign its 3D result to `result` (a `Part`, `Compound`, or `Solid`). The worker preloads `from build123d import *` so common constructors (`Box`, `Cylinder`, `fillet`, `extrude`, `Pos`, `Axis`, ...) are available without an explicit import.
 
@@ -130,7 +130,6 @@ This is sufficient for **local-only** deployments (loopback bind, single-user). 
 
 ## Future Work
 
-- Persistent worker pool (warm OCC import) — phase 6.
 - vLLM client + agentic loop — phase 7.
 - Geometric tool calling — phase 8.
 
