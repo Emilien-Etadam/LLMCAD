@@ -1,4 +1,119 @@
-# STATUS — Migration Docker → Bare metal
+# STATUS
+
+Index :
+- [Phase 5 — Migration Build123d](#phase-5--migration-cadquery--build123d) ← le plus récent
+- Phase 4.5 — Isolation subprocess + Assembly support
+- Phase 4 — System prompt Qwen3 32B
+- Phase 3.5 — Sandbox extension (functions/loops/comprehensions)
+- Phase 2 — Génération CadQuery par LLM (vLLM)
+- Phase 1 — Migration Docker → Bare metal
+
+---
+
+# Phase 5 — Migration CadQuery → Build123d
+
+Date : 2026-04-30
+Tag : `v0.5.0-build123d-migration`
+
+## Résumé
+
+Remplacement de CadQuery 2.7 par Build123d 0.10 dans le pipeline d'exécution (worker + preview + serveur Flask). Suppression du validator AST (`CadQueryValidator.py`, 377 lignes) : l'isolation subprocess + `RLIMIT_AS` est désormais l'unique ligne de défense. **Hypothèse explicite : déploiement local uniquement** ; ne pas exposer sur Internet sans réintroduire de la validation.
+
+## Modifications par fichier
+
+| Fichier | Action | Détails |
+|---|---|---|
+| `cadquery/requirements.txt` | modifié | `cadquery` → `build123d>=0.10.0`. `cadquery-ocp 7.9.3.1` est tiré transitivement. |
+| `cadquery/worker.py` | réécrit | `import cadquery` → `import build123d`. `_extract_solids()` accepte `Part`/`Compound`/`Solid`, rejette `Sketch`/`Curve`. Tessellation `tessellate(tolerance=0.1, angular_tolerance=0.1)`. Exports via `export_step()` / `export_stl()`. Namespace pré-rempli avec `from build123d import *`. **`RLIMIT_AS` par défaut relevé de 2 GiB à 4 GiB** : le stack OCP 7.9 idle à ~1.7 GiB et un fillet+tessellate spike à ~2.5 GiB ; 2 GiB segfaultait `fillet(Box(50,30,10).edges(), 2)`. |
+| `cadquery/Preview.py` | réécrit | Module symétrique au worker pour les appelants externes. Logique `Workplane.objects` / `Assembly.toCompound()` supprimée. |
+| `cadquery/server.py` | modifié | Suppression de l'import et de l'instanciation `CadQueryValidator`. Le worker reçoit le code utilisateur verbatim. Docstring phase-5 explicitant l'hypothèse local-only. |
+| `cadquery/CadQueryValidator.py` | **supprimé** | 377 lignes de whitelist AST devenues redondantes. |
+| `web/models.js` | réécrit | Nouveaux exemples build123d en style algébrique. Exemple par défaut : `Box(50,30,10)` + `fillet(...edges(), radius=2)`. |
+| `web/index.html` | modifié | Placeholder textarea : "Enter CadQuery code here..." → "Enter Build123d code here...". |
+| `web/js/chat.js` | modifié | Label assistant : "CadQuery" → "Build123d". |
+| `README.md` | modifié | Architecture, prérequis, opération, section "Security model" explicite. |
+| `STATUS.md` | modifié | Cette section. |
+
+L'API HTTP est inchangée (`/preview`, `/stl`, `/step`, `/health`). Le format `/preview` reste `{vertices: [x,y,z,...], faces: [[i,j,k],...], objectCount: N}`. `start.sh` (watchdog) inchangé. `node/server.js`, `node/llm.js`, `node/RequestQueue.js` inchangés (le system prompt LLM reste CadQuery-flavour, à reprendre en phase 7).
+
+## Justification de la suppression du validator
+
+1. **Maintenance**: chaque construct build123d (`Box`, `Cylinder`, `Pos`, `Compound`, `fillet`, `extrude`, `Axis`, `sort_by`, ...) aurait dû être réintroduit dans `allowed_cq_operations`. Un import wildcard `from build123d import *` était de toute façon rejeté.
+2. **Redondance**: les classes d'attaques que le validator bloquait (`os`, `subprocess`, `eval`, `__class__.__subclasses__()`, OOM, infinite loop) sont toutes traitées par la couche en aval :
+   - subprocess isolé → un crash ne tue pas Flask
+   - `RLIMIT_AS` (4 GiB) → `MemoryError` propre
+   - timeout 30 s → kill du subprocess
+   - le worker n'a aucun privilège que le serveur Flask n'a pas
+3. **Surface réduite**: 377 lignes en moins, surface d'audit divisée par ~3.
+
+Le coût : tout code Python valide est exécutable. Sur une machine locale c'est le bon trade-off ; en accès distant il faudrait remettre une validation (ou un namespace plus restreint).
+
+## Style des exemples
+
+Style algébrique privilégié, plus prédictible pour un LLM :
+
+```python
+# bon
+result = Box(20,20,20) - Cylinder(5, 25)
+
+# bon
+result = fillet(Box(50,30,10).edges(), radius=2)
+
+# possible mais plus verbeux
+with BuildPart() as bp:
+    Box(20,20,20)
+    Cylinder(5, 25, mode=Mode.SUBTRACT)
+result = bp.part
+```
+
+## Tests d'acceptation (9/9)
+
+Lancés via `./start.sh` (watchdog actif), serveur Python à `127.0.0.1:5002` :
+
+| # | Test | Résultat |
+|---|---|---|
+| 1 | `result = Box(10,10,10)` → preview / STEP / STL | OK : 24 verts / 12 tris / 1 `MANIFOLD_SOLID_BREP` / STL 684 octets |
+| 2 | `result = Box(20,20,20) - Cylinder(5, 25)` | OK : 530 verts / 520 tris / 1 `MANIFOLD_SOLID_BREP` |
+| 3 | `result = fillet(Box(50,30,10).edges(), 2)` | OK : 5552 verts / 9460 tris, bbox `x∈[-25,25] y∈[-15,15] z∈[-5,5]` cohérent |
+| 4 | `result = Compound([Box(10,10,10), Pos(20,0,0) * Box(5,5,5)])` | OK : 48 verts / 24 tris / `objectCount=2` / 2 `MANIFOLD_SOLID_BREP` dans le STEP |
+| 5 | `box = Box(20,20,20); top = box.faces().sort_by(Axis.Z)[-1]; result = box - extrude(top, -5)` | OK : 24 verts / 1 `MANIFOLD_SOLID_BREP` |
+| 6 | `raise ValueError("intentional")` | HTTP 400, traceback complet dans le message, `/health` répond toujours OK |
+| 7 | `bytearray(8 * 1024**3)` puis `result = Box(...)` | HTTP 400 `MemoryError` (RLIMIT_AS coupe), Flask vivant |
+| 8 | `kill -9` du PID python pendant que start.sh tourne | recovery en ~21 s (intervalle health 10 s + 1 s sleep + import build123d ~9 s) |
+| 9 | 10 cycles preview/stl/step | 0 nouveau fichier `cqcode_*` ou `cqout_*` dans `/tmp` |
+
+Test bonus : `result = sketch_obj` (Sketch) → HTTP 400 avec message explicite "le résultat doit être 3D, pas une esquisse/courbe" (cf. `_extract_solids`).
+
+## Points d'attention
+
+1. **`RLIMIT_AS` à 4 GiB par défaut** (au lieu de 2 GiB en phase 4.5). Le stack `cadquery-ocp 7.9.3.1` est plus lourd que le `cadquery 2.7 + cadquery-ocp 7.8` précédent. Configurable via `CADQUERY_WORKER_MEM_LIMIT_MB`.
+2. **Dossier `cadquery/` non renommé**. Le commit 5 du plan (`git mv cadquery/ cadserver/`) est laissé optionnel ; il faudrait mettre à jour `start.sh`, `.env.example`, `node/server.js`. Pas fait pour préserver la lisibilité de `git log --follow` à court terme.
+3. **System prompt LLM (`node/llm.js`) reste CadQuery**. La route `/api/generate` produira du code CadQuery qui sera rejeté par le worker build123d. À refaire en phase 7 (boucle agentique vLLM). En attendant, le panneau de chat est de facto désactivé pour la génération.
+4. **`models.js` plate_with_hole simplifié**: `Box(...) - Cylinder(...)` au lieu d'une chaîne `Workplane().box().faces(">Z").workplane().hole()`. Plus court et plus prédictible pour un LLM futur.
+5. **Pas de validation du dossier renommé**: le service Python est toujours dans `cadquery/`, l'engine est build123d. Référence unique pour l'utilisateur : ce fichier + `README.md`.
+
+## Stratégie de commits
+
+5 commits prévus, 4 réalisés (le 5ᵉ était optionnel et reporté) :
+
+1. `feat: migrate from cadquery to build123d` — `requirements.txt` + `worker.py` + `Preview.py`
+2. `refactor: remove AST validator` — suppression `CadQueryValidator.py` + serveur + bump `RLIMIT_AS` 2 → 4 GiB. **Tag `v0.5.0-build123d-migration` posé ici.**
+3. `feat(ui): update default example and labels for build123d` — `web/`
+4. `docs: update README and STATUS for phase 5` — ce fichier + `README.md`
+5. (reporté) `refactor: rename cadquery/ to cadserver/` — laissé pour plus tard.
+
+## Comment relancer
+
+```bash
+cd /home/pcsurf9/LLMCAD
+./start.sh
+```
+
+Puis ouvrir `http://<IP>:49157`. L'éditeur charge `Box(50,30,10)` + `fillet(...)` par défaut.
+
+---
+
+# Phase 1 — Migration Docker → Bare metal
 
 Date : 2026-04-29
 Cible testée : Ubuntu 24.04 LTS (équivalent LXC Proxmox Debian/Ubuntu)
