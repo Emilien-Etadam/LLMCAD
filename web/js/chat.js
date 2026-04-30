@@ -40,7 +40,7 @@ function addAssistantCodeMessage(code) {
   wrap.className = 'msg msg-assistant';
   const label = document.createElement('div');
   label.className = 'msg-label';
-  label.textContent = 'CadQuery';
+  label.textContent = 'Build123d';
   const pre = document.createElement('pre');
   pre.className = 'msg-code';
   pre.textContent = code;
