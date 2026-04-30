@@ -1,4 +1,4 @@
-cadquery
+build123d>=0.10.0
 numpy
 flask
 gunicorn

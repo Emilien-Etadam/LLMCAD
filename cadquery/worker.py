@@ -1,59 +1,55 @@
 """
 @file worker.py
-@brief Subprocess worker that executes a single validated CadQuery script.
+@brief Subprocess worker that executes a single user Build123d script.
 
 @usage
     python worker.py <code_file> <output_file> <mode>
 
-      <code_file>   Path to the user script (already validated upstream).
+      <code_file>   Path to the user script.
       <output_file> Where to write the result:
-                      mode=preview -> JSON (vertices/faces/objectCount)
+                      mode=preview -> JSON ({vertices, faces, objectCount})
                       mode=stl     -> binary STL
                       mode=step    -> ASCII STEP
       <mode>        One of: preview | stl | step.
 
 @exit codes
     0 - success, output file is valid.
-    1 - runtime error (CadQuery / OCC failure, missing `result`, etc.).
+    1 - runtime error (Build123d / OCC failure, missing `result`, etc.).
     2 - validation / argument error (bad mode, unreadable code file, ...).
 
 @notes
-    - Runs in its own process; segfaults in OpenCascade or runaway memory
-      tear down only this process and leave the parent Flask server alive.
-    - `RLIMIT_AS` is set to 1 GiB before doing any heavy import. CadQuery +
-      cadquery-ocp + numpy idle around 450 MB, so 1 GiB leaves ~550 MB for
-      the user script before MemoryError.
-    - Defense in depth: the same restricted-builtins / sandboxed-import shim
-      used by the (now-deprecated) in-process executor is rebuilt here from
-      `CadQueryValidator.allowed_builtins`. The worker never imports user
-      code; it `exec()`s it with these globals.
+    Phase 5 (Build123d migration):
+      - The previous AST-level validator (CadQueryValidator) is gone. The
+        only sandboxing left is process isolation + RLIMIT_AS. Local-only
+        deployment is assumed; do NOT expose this server to the public
+        internet without re-introducing a validator.
+      - The user script is `exec()`d in a fresh namespace prepopulated with
+        `from build123d import *`. The script must assign its 3D result to
+        a variable named `result`.
+      - Segfaults / runaway memory in OpenCascade tear down only this
+        worker; the parent Flask server stays alive and the next request
+        spawns a fresh subprocess.
 """
 
-import builtins as _builtins
 import json
-import math
 import os
 import resource
 import sys
 import traceback
+from typing import Any, List
 
-# RLIMIT_AS must be set BEFORE importing the heavy stack (cadquery / OCP).
-# The phase 4.5 spec calls for a 1 GiB cap, but on this stack
-# (cadquery 2.7 + cadquery-ocp 7.8.1.1 + numpy 2.4.4) `import cadquery`
-# alone reserves ~1.3 GiB of virtual address space, so a 1 GiB cap segfaults
-# the worker at import time. We default to 2 GiB (idle ~1.3 GiB + headroom
-# for the user script). Operators can tighten / loosen via env var:
+# RLIMIT_AS must be set BEFORE importing the heavy stack (build123d / OCP).
+# build123d 0.10 + cadquery-ocp 7.9 + numpy reserve roughly 1.3 GiB of
+# virtual address space at idle, so a too-tight cap segfaults the worker
+# at import time. Default to 2 GiB (idle ~1.3 GiB + headroom for the user
+# script). Operators can tighten / loosen via env var:
 #     CADQUERY_WORKER_MEM_LIMIT_MB=512   # tighter (will likely crash)
 #     CADQUERY_WORKER_MEM_LIMIT_MB=0     # disabled
 _MEM_LIMIT_MB = int(os.environ.get("CADQUERY_WORKER_MEM_LIMIT_MB", "2048"))
 
 
-def _apply_memory_limit():
-    """Best-effort RLIMIT_AS cap. Failure is logged but non-fatal.
-
-    Called BEFORE the heavy imports below so the cap actually applies to the
-    cadquery / numpy mmap'd regions.
-    """
+def _apply_memory_limit() -> None:
+    """Best-effort RLIMIT_AS cap. Failure is logged but non-fatal."""
     if _MEM_LIMIT_MB <= 0:
         return
     target = _MEM_LIMIT_MB * 1024 * 1024
@@ -72,99 +68,53 @@ def _apply_memory_limit():
 _apply_memory_limit()
 
 
-import cadquery as cq  # noqa: E402 - intentionally below RLIMIT_AS application
-import numpy as np  # noqa: E402
-
-from CadQueryValidator import CadQueryValidator  # noqa: E402
-
-# --- Exit codes -------------------------------------------------------------
+import build123d as _b3d  # noqa: E402 - intentionally below RLIMIT_AS application
 
 EXIT_OK = 0
 EXIT_RUNTIME = 1
 EXIT_VALIDATION = 2
 
-# Modules importable from inside the sandbox at runtime. Mirrors
-# CadQueryValidator's import whitelist.
-_RUNTIME_ALLOWED_IMPORTS = {"cadquery", "math", "numpy", "typing"}
 
+def _extract_solids(result: Any) -> List[_b3d.Solid]:
+    """Normalize a user `result` into a flat list of Solids.
 
-def _sandbox_import(name, globals=None, locals=None, fromlist=(), level=0):
-    """Restricted __import__ injected into the sandbox builtins."""
-    if level != 0:
-        raise ImportError("Relative imports are not allowed in sandbox")
-    root = name.split(".")[0]
-    if root not in _RUNTIME_ALLOWED_IMPORTS:
-        raise ImportError(f"Import of '{name}' is not allowed in sandbox")
-    return __import__(name, globals, locals, fromlist, level)
-
-
-def _build_safe_builtins(validator):
-    safe = {
-        name: getattr(_builtins, name)
-        for name in validator.allowed_builtins
-        if hasattr(_builtins, name)
-    }
-    safe["__import__"] = _sandbox_import
-    return safe
-
-
-# --- Result handling --------------------------------------------------------
-
-
-def _extract_solids(shape):
-    """Pull Solids out of a single CadQuery shape (Solid or Compound)."""
-    if isinstance(shape, cq.occ_impl.shapes.Solid):
-        return [shape]
-    if isinstance(shape, cq.occ_impl.shapes.Compound):
-        return list(shape.Solids())
-    return []
-
-
-def _result_solids(result):
-    """Normalize any supported result into a list of Solids."""
-    if isinstance(result, cq.Workplane):
-        out = []
-        for obj in result.objects:
-            out.extend(_extract_solids(obj))
-        return out
-    if isinstance(result, cq.Assembly):
-        return list(result.toCompound().Solids())
-    if isinstance(result, cq.occ_impl.shapes.Compound):
-        return list(result.Solids())
-    if isinstance(result, cq.occ_impl.shapes.Solid):
-        return [result]
-    return []
-
-
-def _to_exportable(result):
-    """Coerce result to something `cq.exporters.export` accepts.
-
-    cq.exporters.export handles Workplane and Shape (incl. Compound/Solid),
-    but NOT Assembly. For Assembly we collapse to its Compound; this loses
-    the named-part hierarchy in STEP, but produces a valid file. (For full
-    hierarchy preservation, a future revision could call Assembly.save()
-    directly when the user assigns an Assembly to `result`.)
+    Order of isinstance checks matters: Sketch / Curve / Part all inherit
+    from Compound, so the 2D guards must run first.
     """
-    if isinstance(result, cq.Assembly):
-        return result.toCompound()
-    return result
+    if isinstance(result, (_b3d.Sketch, _b3d.Curve)):
+        raise RuntimeError(
+            "le résultat doit être 3D, pas une esquisse/courbe"
+        )
+    if isinstance(result, (_b3d.Part, _b3d.Compound)):
+        return list(result.solids())
+    if isinstance(result, _b3d.Solid):
+        return [result]
+    raise RuntimeError(f"type non supporté: {type(result).__name__}")
 
 
-def _do_preview(result, output_path):
-    solids = _result_solids(result)
+def _to_compound(result: Any) -> _b3d.Compound:
+    """Wrap any supported result into a Compound for STEP/STL export."""
+    if isinstance(result, _b3d.Compound):
+        return result
+    if isinstance(result, _b3d.Solid):
+        return _b3d.Compound([result])
+    raise RuntimeError(f"type non supporté pour export: {type(result).__name__}")
+
+
+def _do_preview(result: Any, output_path: str) -> int:
+    solids = _extract_solids(result)
     if not solids:
-        sys.stderr.write("No solids found in result\n")
-        return EXIT_RUNTIME
-    all_vertices = []
-    all_faces = []
+        raise RuntimeError("aucun solide trouvé dans le résultat")
+    all_vertices: List[float] = []
+    all_faces: List[List[int]] = []
     vertex_offset = 0
     for solid in solids:
-        mesh = solid.tessellate(1.0, 1.0)
-        for vertex in mesh[0]:
-            all_vertices.extend([vertex.x, vertex.y, vertex.z])
-        for face in mesh[1]:
-            all_faces.extend([i + vertex_offset for i in face])
-        vertex_offset += len(mesh[0])
+        verts, tris = solid.tessellate(tolerance=0.1, angular_tolerance=0.1)
+        for v in verts:
+            all_vertices.extend([v.X, v.Y, v.Z])
+        for tri in tris:
+            all_faces.append([tri[0] + vertex_offset, tri[1] + vertex_offset, tri[2] + vertex_offset])
+        vertex_offset += len(verts)
     payload = {
         "vertices": all_vertices,
         "faces": all_faces,
@@ -175,20 +125,19 @@ def _do_preview(result, output_path):
     return EXIT_OK
 
 
-def _do_stl(result, output_path):
-    cq.exporters.export(_to_exportable(result), output_path, exportType="STL")
+def _do_stl(result: Any, output_path: str) -> int:
+    compound = _to_compound(result)
+    _b3d.export_stl(compound, output_path, tolerance=0.01, angular_tolerance=0.1)
     return EXIT_OK
 
 
-def _do_step(result, output_path):
-    cq.exporters.export(_to_exportable(result), output_path, exportType="STEP")
+def _do_step(result: Any, output_path: str) -> int:
+    compound = _to_compound(result)
+    _b3d.export_step(compound, output_path)
     return EXIT_OK
 
 
-# --- Entry point ------------------------------------------------------------
-
-
-def main():
+def main() -> int:
     if len(sys.argv) != 4:
         sys.stderr.write("Usage: worker.py <code_file> <output_file> <mode>\n")
         return EXIT_VALIDATION
@@ -201,8 +150,6 @@ def main():
         sys.stderr.write(f"Invalid mode '{mode}'\n")
         return EXIT_VALIDATION
 
-    # RLIMIT_AS was already applied at module import time, before cadquery.
-
     try:
         with open(code_path, "r", encoding="utf-8") as fh:
             code = fh.read()
@@ -210,27 +157,23 @@ def main():
         sys.stderr.write(f"Could not read code file '{code_path}': {exc}\n")
         return EXIT_VALIDATION
 
-    validator = CadQueryValidator()
-    safe_builtins = _build_safe_builtins(validator)
-    globals_dict = {
-        "cq": cq,
-        "np": np,
-        "math": math,
-        "__builtins__": safe_builtins,
-    }
-    locals_dict = {}
+    # Prepopulate the namespace with `from build123d import *` so user code
+    # need not (and typically does not) repeat the import. We also expose
+    # `b3d` for explicit access if desired.
+    namespace: dict = {"__name__": "__user_script__", "b3d": _b3d}
+    exec("from build123d import *", namespace)
 
     try:
-        exec(code, globals_dict, locals_dict)
+        exec(code, namespace)
     except BaseException as exc:  # noqa: BLE001 - surface any user-code failure
         sys.stderr.write(f"{type(exc).__name__}: {exc}\n")
         traceback.print_exc(file=sys.stderr)
         return EXIT_RUNTIME
 
-    if "result" not in locals_dict:
+    if "result" not in namespace:
         sys.stderr.write("Code did not assign a value to 'result'\n")
         return EXIT_RUNTIME
-    result = locals_dict["result"]
+    result = namespace["result"]
 
     try:
         if mode == "preview":

@@ -1,85 +1,73 @@
 """
 @file Preview.py
-@brief Generate preview mesh data from CadQuery objects.
-@author 30hours
+@brief Generate preview mesh data from Build123d objects.
 
-Phase 4.5: accept any of `cq.Workplane`, `cq.Assembly`, `cq.Compound`, or
-`cq.occ_impl.shapes.Solid` as a result. The caller (server.py / worker.py)
-no longer constrains the script to assign a Workplane to `result`.
+Phase 5: rewritten on top of build123d. The previous implementation
+relied on cadquery's `Workplane.objects` and `Assembly.toCompound()`,
+both of which no longer exist. The accepted result types are now Part,
+Compound, or Solid -- the same set the worker accepts.
+
+This module is kept around for symmetry / external callers; the in-tree
+worker (worker.py) does its own preview generation to avoid an extra
+import path. They share the same tessellation parameters and output
+schema.
 """
 
-import cadquery as cq
+from typing import Any, Dict, List
+
+import build123d as _b3d
 
 
-def extract_solids(shape):
-  """
-  @brief Extract all solids from a single OCC/CadQuery shape.
+def _extract_solids(result: Any) -> List[_b3d.Solid]:
+    """Normalize a build123d result into a flat list of Solids.
 
-  Handles bare Solids and Compounds (which is what `cq.Assembly.toCompound()`
-  returns and what often shows up as the first/only entry of `Workplane.objects`).
-  """
-  if isinstance(shape, cq.occ_impl.shapes.Solid):
-    return [shape]
-  if isinstance(shape, cq.occ_impl.shapes.Compound):
-    return list(shape.Solids())
-  return []
-
-
-def _result_solids(result):
-  """
-  @brief Normalize any supported result type into a flat list of Solids.
-
-  Supported inputs:
-    - cq.Workplane  -> iterate `.objects`, extracting solids/compounds.
-    - cq.Assembly   -> convert to compound, list its Solids().
-    - cq.Compound   -> list its Solids() directly.
-    - cq.Solid      -> single-element list.
-  Anything else returns an empty list (caller surfaces a useful error).
-  """
-  if isinstance(result, cq.Workplane):
-    out = []
-    for obj in result.objects:
-      out.extend(extract_solids(obj))
-    return out
-  if isinstance(result, cq.Assembly):
-    return list(result.toCompound().Solids())
-  if isinstance(result, cq.occ_impl.shapes.Compound):
-    return list(result.Solids())
-  if isinstance(result, cq.occ_impl.shapes.Solid):
-    return [result]
-  return []
+    Order matters: Sketch / Curve inherit from Compound, so 2D guards
+    must run before the Compound branch. Returns an empty list for
+    unsupported types so the caller can build a useful error message.
+    """
+    if isinstance(result, (_b3d.Sketch, _b3d.Curve)):
+        return []
+    if isinstance(result, (_b3d.Part, _b3d.Compound)):
+        return list(result.solids())
+    if isinstance(result, _b3d.Solid):
+        return [result]
+    return []
 
 
-def preview(result):
-  """
-  @brief Generate preview mesh data from a CadQuery result.
-  @param result: cq.Workplane | cq.Assembly | cq.Compound | cq.Solid
-  @return (dict, None) on success; (None, error_message) on failure.
+def compute_preview(result: Any) -> Dict[str, Any]:
+    """Tessellate `result` and return the JSON-ready preview payload.
 
-  Output dict structure (three.js consumer):
-    'vertices': [x1,y1,z1, x2,y2,z2, ...],
-    'faces':    [v1,v2,v3, v4,v5,v6, ...],
-    'objectCount': number of solids tessellated.
+    Output schema (consumed by the three.js frontend):
+      vertices : flat list [x1,y1,z1, x2,y2,z2, ...]
+      faces    : list of [i, j, k] triangle index triples
+      objectCount: number of solids tessellated
 
-  Coarse tessellation parameters (1.0, 1.0) match cq-editor's instant preview.
-  """
-  solids = _result_solids(result)
-  if not solids:
-    return None, "No solids found in result"
+    Tessellation parameters (0.1, 0.1) match the worker's `_do_preview`
+    so /preview and /stl are visually consistent on the frontend.
+    """
+    solids = _extract_solids(result)
+    if not solids:
+        raise RuntimeError(
+            f"aucun solide trouvé (type reçu: {type(result).__name__})"
+        )
 
-  all_vertices = []
-  all_faces = []
-  vertex_offset = 0
-  for solid in solids:
-    mesh = solid.tessellate(1.0, 1.0)
-    for vertex in mesh[0]:
-      all_vertices.extend([vertex.x, vertex.y, vertex.z])
-    for face in mesh[1]:
-      all_faces.extend([v + vertex_offset for v in face])
-    vertex_offset += len(mesh[0])
+    all_vertices: List[float] = []
+    all_faces: List[List[int]] = []
+    vertex_offset = 0
+    for solid in solids:
+        verts, tris = solid.tessellate(tolerance=0.1, angular_tolerance=0.1)
+        for v in verts:
+            all_vertices.extend([v.X, v.Y, v.Z])
+        for tri in tris:
+            all_faces.append([
+                tri[0] + vertex_offset,
+                tri[1] + vertex_offset,
+                tri[2] + vertex_offset,
+            ])
+        vertex_offset += len(verts)
 
-  return {
-    'vertices': all_vertices,
-    'faces': all_faces,
-    'objectCount': len(solids),
-  }, None
+    return {
+        "vertices": all_vertices,
+        "faces": all_faces,
+        "objectCount": len(solids),
+    }
