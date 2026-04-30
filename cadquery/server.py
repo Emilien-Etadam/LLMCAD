@@ -15,6 +15,7 @@ import atexit
 import io
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -48,6 +49,16 @@ _REQUEST_TIMEOUT = float(
 pool = WorkerPool(size=_POOL_SIZE, mem_limit_mb=_WORKER_MEM_MB)
 pool.start()
 atexit.register(pool.shutdown)
+
+
+def _signal_shutdown(_signum: int, _frame: object | None) -> None:
+    """SIGTERM/SIGINT : même cleanup qu'à la sortie normale (pas de workers orphelins)."""
+    pool.shutdown()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, _signal_shutdown)
+signal.signal(signal.SIGINT, _signal_shutdown)
 
 
 def _worker_error_message(resp: dict) -> str:
