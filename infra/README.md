@@ -15,6 +15,11 @@ Ce dossier contient un script exécutable **sur un nœud Proxmox VE** pour crée
   pveam download local debian-13-standard_13.1-1_amd64.tar.zst
   ```
 
+  Si `CT_TEMPLATE` est introuvable, le script est **adaptatif** :
+  il prend automatiquement la dernière Debian 13 déjà présente en local, ou
+  lance `pveam update` puis télécharge la dernière Debian 13 disponible vers le
+  stockage du template demandé.
+
   Le nom par défaut du template dans le script est :
 
   `local:vztmpl/debian-13-standard_13.1-1_amd64.tar.zst`

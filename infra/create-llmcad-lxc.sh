@@ -103,6 +103,11 @@ template_available() {
   return 1
 }
 
+template_storage_from_ref() {
+  local tpl="$1"
+  echo "${tpl%%:*}"
+}
+
 list_available_debian13_templates() {
   # Show known Debian 13 templates from local cache/index when available.
   local lines=""
@@ -124,6 +129,50 @@ list_available_debian13_templates() {
     log "  pveam update"
     log "  pveam available | grep debian-13-standard"
   fi
+}
+
+latest_debian13_template_from_local() {
+  pveam list local 2>/dev/null \
+    | grep -Eo 'debian-13-standard_[^[:space:]]+_amd64\.tar\.zst' \
+    | sort -V \
+    | tail -1
+}
+
+latest_debian13_template_from_available() {
+  pveam available 2>/dev/null \
+    | grep -Eo 'debian-13-standard_[^[:space:]]+_amd64\.tar\.zst' \
+    | sort -V \
+    | tail -1
+}
+
+ensure_template_available_or_adapt() {
+  local requested="$1"
+  local template_storage selected
+
+  if template_available "$requested"; then
+    echo "$requested"
+    return 0
+  fi
+
+  template_storage="$(template_storage_from_ref "$requested")"
+  selected="$(latest_debian13_template_from_local || true)"
+  if [[ -n "$selected" ]]; then
+    log "Requested template not found. Using latest local Debian 13 template: $selected"
+    echo "${template_storage}:vztmpl/${selected}"
+    return 0
+  fi
+
+  log "No local Debian 13 template found. Refreshing appliance index..."
+  pveam update
+  selected="$(latest_debian13_template_from_available || true)"
+  if [[ -z "$selected" ]]; then
+    list_available_debian13_templates
+    die "No Debian 13 template found in 'pveam available'."
+  fi
+
+  log "Downloading latest Debian 13 template to storage '${template_storage}': $selected"
+  pveam download "$template_storage" "$selected"
+  echo "${template_storage}:vztmpl/${selected}"
 }
 
 ct_exists() {
@@ -241,14 +290,8 @@ main() {
     die "Storage '${CT_STORAGE}' is missing or not available. Check 'pvesm status'."
   fi
 
-  if ! template_available "$CT_TEMPLATE"; then
-    log "Template '${CT_TEMPLATE}' not found. Download it first, for example:"
-    log "  pveam update"
-    log "  pveam available | grep debian-13-standard"
-    log "  pveam download local debian-13-standard_13.1-1_amd64.tar.zst"
-    list_available_debian13_templates
-    die "Aborting because the container template is missing."
-  fi
+  CT_TEMPLATE="$(ensure_template_available_or_adapt "$CT_TEMPLATE")"
+  log "Template selected: $CT_TEMPLATE"
 
   if ct_exists "$CT_ID"; then
     confirm_destroy "$CT_ID"
