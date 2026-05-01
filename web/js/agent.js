@@ -8,6 +8,31 @@ const codeInput = document.getElementById('code-input');
 let isAgentRunning = false;
 let finalCode = '';
 let iterationState = new Map();
+let ragState = null;
+
+function ensureRagSection() {
+  if (ragState) return ragState;
+  const details = document.createElement('details');
+  details.className = 'agent-rag';
+  details.open = false;
+
+  const summary = document.createElement('summary');
+  summary.textContent = 'Documentation référencée';
+
+  const meta = document.createElement('div');
+  meta.className = 'rag-meta';
+  meta.textContent = '';
+
+  const list = document.createElement('div');
+  list.className = 'rag-list';
+
+  details.appendChild(summary);
+  details.appendChild(meta);
+  details.appendChild(list);
+  agentIterations.prepend(details);
+  ragState = { details, summary, meta, list };
+  return ragState;
+}
 
 function setAgentBusy(busy) {
   isAgentRunning = busy;
@@ -91,13 +116,52 @@ function updateIterationStatus(n, status) {
 }
 
 function applyAgentEvent(event) {
+  if (event.type === 'rag_start') {
+    const rag = ensureRagSection();
+    rag.meta.textContent = 'Recherche dans la documentation...';
+    rag.list.innerHTML = '';
+    agentStatus.textContent = 'Recherche dans la documentation...';
+    return;
+  }
+
+  if (event.type === 'rag_retrieved') {
+    const rag = ensureRagSection();
+    const count = Number(event.chunks_count || 0);
+    const reason = event.reason || 'unknown';
+    rag.meta.textContent = `${count} chunks trouvés (raison: ${reason})`;
+    rag.list.innerHTML = '';
+
+    const chunks = Array.isArray(event.chunks) ? event.chunks : [];
+    for (const chunk of chunks) {
+      const item = document.createElement('div');
+      item.className = 'rag-item';
+
+      const header = document.createElement('div');
+      header.className = 'rag-item-header';
+      const source = chunk.source_file || 'unknown';
+      const score = typeof chunk.score === 'number' ? chunk.score.toFixed(3) : 'n/a';
+      header.textContent = `Source: ${source} | score: ${score}`;
+
+      const preview = document.createElement('pre');
+      preview.className = 'rag-item-preview';
+      preview.textContent = chunk.text_preview || '';
+
+      item.appendChild(header);
+      item.appendChild(preview);
+      rag.list.appendChild(item);
+    }
+    return;
+  }
+
   if (event.type === 'iteration_start') {
     iterationState.set(event.n, createIterationNode(event.n));
     agentStatus.textContent = `Itération ${event.n} démarrée`;
     return;
   }
 
-  const currentN = Math.max(...Array.from(iterationState.keys(), (k) => Number(k)));
+  const currentN = iterationState.size
+    ? Math.max(...Array.from(iterationState.keys(), (k) => Number(k)))
+    : 0;
   const current = iterationState.get(currentN);
 
   if (event.type === 'llm_token') {
@@ -209,6 +273,7 @@ agentGenerateBtn.addEventListener('click', async () => {
   if (!prompt) return;
 
   iterationState = new Map();
+  ragState = null;
   finalCode = '';
   agentIterations.innerHTML = '';
   agentLoadCodeBtn.disabled = true;

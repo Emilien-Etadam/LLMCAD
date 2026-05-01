@@ -295,6 +295,63 @@ body, html {
   color: var(--text-bright);
 }
 
+.agent-rag {
+  border: 1px solid rgba(74, 158, 255, 0.45);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  background: rgba(74, 158, 255, 0.08);
+  padding: 8px;
+}
+
+.agent-rag summary {
+  cursor: pointer;
+  user-select: none;
+  color: var(--text);
+  opacity: 0.9;
+}
+
+.agent-rag summary:hover {
+  opacity: 1;
+  color: var(--text-bright);
+}
+
+.rag-meta {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.rag-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rag-item {
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(74, 158, 255, 0.35);
+  border-radius: 4px;
+  padding: 8px;
+}
+
+.rag-item-header {
+  font-size: 12px;
+  color: var(--text-bright);
+  margin-bottom: 6px;
+}
+
+.rag-item-preview {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text);
+  opacity: 0.9;
+  font-family: Arial, sans-serif;
+}
+
 .thinking-content {
   margin: 8px 0 0;
   max-height: 400px;

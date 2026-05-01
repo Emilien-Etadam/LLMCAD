@@ -12,6 +12,14 @@ const AGENT_REQUEST_TIMEOUT_MS = parseInt(process.env.AGENT_REQUEST_TIMEOUT_MS |
 const CADQUERY_HOST = process.env.CADQUERY_HOST || '127.0.0.1';
 const CADQUERY_PORT = parseInt(process.env.CADQUERY_PORT || '5002', 10);
 const CAD_SERVER_URL = process.env.CAD_SERVER_URL || `http://${CADQUERY_HOST}:${CADQUERY_PORT}`;
+const RAG_CONFIG = {
+  qdrantUrl: process.env.QDRANT_URL || 'http://192.168.30.127:6333',
+  qdrantCollection: process.env.QDRANT_COLLECTION || 'build123d_docs',
+  teiUrl: process.env.TEI_URL || 'http://192.168.30.121:8080',
+  topK: parseInt(process.env.RAG_TOP_K || '5', 10),
+  scoreThreshold: parseFloat(process.env.RAG_SCORE_THRESHOLD || '0.40'),
+  enabled: process.env.RAG_ENABLED !== 'false'
+};
 
 const SYSTEM_PROMPT = `Tu es un assistant CAO expert en Build123d (Python).
 
@@ -101,6 +109,91 @@ function splitErrorAndTraceback(message) {
 }
 
 /**
+ * @param {string} text
+ * @returns {Promise<number[]>}
+ */
+async function embedQuery(text) {
+  const res = await fetch(`${RAG_CONFIG.teiUrl}/embed`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ inputs: text })
+  });
+  if (!res.ok) throw new Error(`TEI embed failed: ${res.status}`);
+  const data = await res.json();
+  if (!Array.isArray(data) || !Array.isArray(data[0])) {
+    throw new Error('TEI embed response malformed');
+  }
+  return data[0];
+}
+
+/**
+ * @param {number[]} vector
+ * @param {number} limit
+ * @returns {Promise<Array<{id:string|number, score:number, payload?:{source_file?:string, text?:string}}>>}
+ */
+async function searchQdrant(vector, limit) {
+  const res = await fetch(
+    `${RAG_CONFIG.qdrantUrl}/collections/${RAG_CONFIG.qdrantCollection}/points/search`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        vector,
+        limit,
+        with_payload: true
+      })
+    }
+  );
+  if (!res.ok) throw new Error(`Qdrant search failed: ${res.status}`);
+  const data = await res.json();
+  if (!data || !Array.isArray(data.result)) {
+    throw new Error('Qdrant search response malformed');
+  }
+  return data.result;
+}
+
+/**
+ * @param {string} userPrompt
+ * @returns {Promise<{chunks:Array<{score:number, source_file:string, text:string}>, reason:string, total_results?:number, error?:string}>}
+ */
+async function retrieveContext(userPrompt) {
+  if (!RAG_CONFIG.enabled) return { chunks: [], reason: 'disabled' };
+  try {
+    const vector = await embedQuery(userPrompt);
+    const results = await searchQdrant(vector, RAG_CONFIG.topK);
+    const filtered = results.filter((r) => Number(r?.score || 0) >= RAG_CONFIG.scoreThreshold);
+    return {
+      chunks: filtered.map((r) => ({
+        score: Number(r.score || 0),
+        source_file: r?.payload?.source_file || 'unknown',
+        text: r?.payload?.text || ''
+      })),
+      reason: filtered.length === 0 ? 'no_relevant_chunks' : 'ok',
+      total_results: results.length
+    };
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.warn('[rag] retrieval failed, continuing without context:', errorMessage);
+    return { chunks: [], reason: 'error', error: errorMessage };
+  }
+}
+
+/**
+ * @param {Array<{score:number, source_file:string, text:string}>} chunks
+ * @returns {string}
+ */
+function formatChunksForPrompt(chunks) {
+  if (!chunks.length) return '';
+  const formatted = chunks
+    .map(
+      (c, i) =>
+        `[Reference ${i + 1}, source: ${c.source_file}, score: ${c.score.toFixed(3)}]\n${c.text}`
+    )
+    .join('\n\n---\n\n');
+  return `\n\nReference documentation from Build123d:\n${formatted}\n\nUse the references above to write accurate Build123d code. The references show real API signatures and examples.\n`;
+}
+
+/**
  * @typedef {Object} PreviewSuccess
  * @property {true} ok
  * @property {{vertices:number[], faces:number[], objectCount?:number}} preview
@@ -171,8 +264,23 @@ class CADAgent {
    * @param {string} userPrompt
    */
   async *run(userPrompt) {
+    yield { type: 'rag_start' };
+    const ragResult = await retrieveContext(userPrompt);
+    yield {
+      type: 'rag_retrieved',
+      chunks_count: ragResult.chunks.length,
+      reason: ragResult.reason,
+      chunks: ragResult.chunks.map((c) => ({
+        source_file: c.source_file,
+        score: c.score,
+        text_preview: c.text.substring(0, 200) + (c.text.length > 200 ? '…' : '')
+      }))
+    };
+    const ragContext = formatChunksForPrompt(ragResult.chunks);
+    const enrichedSystemPrompt = SYSTEM_PROMPT + ragContext;
+
     const messages = [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: enrichedSystemPrompt },
       { role: 'user', content: userPrompt }
     ];
 
