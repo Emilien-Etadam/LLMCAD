@@ -13,6 +13,140 @@ const CADQUERY_HOST = process.env.CADQUERY_HOST || '127.0.0.1';
 const CADQUERY_PORT = parseInt(process.env.CADQUERY_PORT || '5002', 10);
 const CAD_SERVER_URL = process.env.CAD_SERVER_URL || `http://${CADQUERY_HOST}:${CADQUERY_PORT}`;
 
+const RAG_CONFIG = {
+  qdrantUrl: (process.env.QDRANT_URL || 'http://192.168.30.127:6333').replace(/\/+$/, ''),
+  qdrantCollection: process.env.QDRANT_COLLECTION || 'build123d_docs',
+  teiUrl: (process.env.TEI_URL || 'http://192.168.30.121:8080').replace(/\/+$/, ''),
+  topK: parseInt(process.env.RAG_TOP_K || '5', 10),
+  scoreThreshold: parseFloat(process.env.RAG_SCORE_THRESHOLD || '0.40'),
+  enabled: process.env.RAG_ENABLED !== 'false'
+};
+
+/**
+ * @param {unknown} data
+ * @returns {number[][]}
+ */
+function normalizeEmbedResponse(data) {
+  if (Array.isArray(data)) {
+    if (data.length && typeof data[0] === 'number') {
+      return [data.map((x) => Number(x))];
+    }
+    return data
+      .filter((row) => Array.isArray(row))
+      .map((row) => row.map((x) => Number(x)));
+  }
+  if (data && typeof data === 'object') {
+    const d = /** @type {{ embeddings?: unknown; data?: unknown }} */ (data);
+    if (Array.isArray(d.embeddings)) {
+      return normalizeEmbedResponse(d.embeddings);
+    }
+    if (Array.isArray(d.data)) {
+      const vecs = [];
+      for (const item of d.data) {
+        if (item && typeof item === 'object' && Array.isArray(item.embedding)) {
+          vecs.push(item.embedding.map((x) => Number(x)));
+        }
+      }
+      if (vecs.length) return vecs;
+    }
+  }
+  throw new Error('Unexpected TEI embed response shape');
+}
+
+/**
+ * @param {string} text
+ * @returns {Promise<number[]>}
+ */
+async function embedQuery(text) {
+  const res = await fetch(`${RAG_CONFIG.teiUrl}/embed`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ inputs: [text] })
+  });
+  if (!res.ok) throw new Error(`TEI embed failed: ${res.status}`);
+  const data = await res.json();
+  const vectors = normalizeEmbedResponse(data);
+  if (!vectors.length) throw new Error('TEI embed returned no vectors');
+  return vectors[0];
+}
+
+/**
+ * @param {number[]} vector
+ * @param {number} limit
+ * @returns {Promise<Array<{ id: unknown; score: number; payload?: Record<string, unknown> }>>}
+ */
+async function searchQdrant(vector, limit) {
+  const res = await fetch(
+    `${RAG_CONFIG.qdrantUrl}/collections/${encodeURIComponent(RAG_CONFIG.qdrantCollection)}/points/search`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        vector,
+        limit,
+        with_payload: true
+      })
+    }
+  );
+  if (!res.ok) throw new Error(`Qdrant search failed: ${res.status}`);
+  const data = await res.json();
+  const result = data && data.result;
+  if (!Array.isArray(result)) throw new Error('Qdrant search: invalid result');
+  return result;
+}
+
+/**
+ * @param {string} userPrompt
+ * @returns {Promise<{ chunks: Array<{ score: number; source_file: string; text: string }>; reason: string; total_results?: number; error?: string }>}
+ */
+async function retrieveContext(userPrompt) {
+  if (!RAG_CONFIG.enabled) {
+    return { chunks: [], reason: 'disabled' };
+  }
+
+  try {
+    const vector = await embedQuery(userPrompt);
+    const results = await searchQdrant(vector, RAG_CONFIG.topK);
+    const filtered = results.filter((r) => typeof r.score === 'number' && r.score >= RAG_CONFIG.scoreThreshold);
+
+    return {
+      chunks: filtered.map((r) => {
+        const payload = r.payload && typeof r.payload === 'object' ? r.payload : {};
+        const src = payload.source_file;
+        const txt = payload.text;
+        return {
+          score: r.score,
+          source_file: typeof src === 'string' ? src : '',
+          text: typeof txt === 'string' ? txt : ''
+        };
+      }),
+      reason: filtered.length === 0 ? 'no_relevant_chunks' : 'ok',
+      total_results: results.length
+    };
+  } catch (err) {
+    const msg = err && err.message ? String(err.message) : String(err);
+    console.warn('[rag] retrieval failed, continuing without context:', msg);
+    return { chunks: [], reason: 'error', error: msg };
+  }
+}
+
+/**
+ * @param {Array<{ score: number; source_file: string; text: string }>} chunks
+ * @returns {string}
+ */
+function formatChunksForPrompt(chunks) {
+  if (chunks.length === 0) return '';
+
+  const formatted = chunks
+    .map(
+      (c, i) =>
+        `[Reference ${i + 1}, source: ${c.source_file}, score: ${c.score.toFixed(3)}]\n${c.text}`
+    )
+    .join('\n\n---\n\n');
+
+  return `\n\nReference documentation from Build123d:\n${formatted}\n\nUse the references above to write accurate Build123d code. The references show real API signatures and examples.\n`;
+}
+
 const SYSTEM_PROMPT = `Tu es un assistant CAO expert en Build123d (Python).
 
 Génère UNIQUEMENT du code Python valide qui :
@@ -171,8 +305,27 @@ class CADAgent {
    * @param {string} userPrompt
    */
   async *run(userPrompt) {
+    yield { type: 'rag_start' };
+    const ragResult = await retrieveContext(userPrompt);
+    yield {
+      type: 'rag_retrieved',
+      chunks_count: ragResult.chunks.length,
+      reason: ragResult.reason,
+      chunks: ragResult.chunks.map((c) => {
+        const t = c.text || '';
+        return {
+          source_file: c.source_file,
+          score: c.score,
+          text_preview: t.substring(0, 200) + (t.length > 200 ? '…' : '')
+        };
+      })
+    };
+
+    const ragContext = formatChunksForPrompt(ragResult.chunks);
+    const enrichedSystemPrompt = SYSTEM_PROMPT + ragContext;
+
     const messages = [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: enrichedSystemPrompt },
       { role: 'user', content: userPrompt }
     ];
 
