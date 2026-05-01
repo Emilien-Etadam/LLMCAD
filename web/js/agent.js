@@ -8,6 +8,23 @@ const codeInput = document.getElementById('code-input');
 let isAgentRunning = false;
 let finalCode = '';
 let iterationState = new Map();
+/** @type {HTMLDivElement | null} */
+let agentRagHost = null;
+
+function ensureAgentRagHost() {
+  if (agentRagHost && agentRagHost.isConnected) return agentRagHost;
+  agentRagHost = document.createElement('div');
+  agentRagHost.className = 'agent-rag-host';
+  agentIterations.parentNode.insertBefore(agentRagHost, agentIterations);
+  return agentRagHost;
+}
+
+function clearAgentRagHost() {
+  if (agentRagHost) {
+    agentRagHost.remove();
+    agentRagHost = null;
+  }
+}
 
 function setAgentBusy(busy) {
   isAgentRunning = busy;
@@ -91,6 +108,72 @@ function updateIterationStatus(n, status) {
 }
 
 function applyAgentEvent(event) {
+  if (event.type === 'rag_start') {
+    const host = ensureAgentRagHost();
+    host.innerHTML = '';
+    const row = document.createElement('div');
+    row.className = 'agent-rag-spinner-row';
+    const spin = document.createElement('span');
+    spin.className = 'agent-rag-spinner';
+    spin.setAttribute('aria-hidden', 'true');
+    const label = document.createElement('span');
+    label.className = 'agent-rag-spinner-label';
+    label.textContent = 'Recherche dans la documentation...';
+    row.appendChild(spin);
+    row.appendChild(label);
+    host.appendChild(row);
+    agentStatus.textContent = 'Recherche dans la documentation...';
+    return;
+  }
+
+  if (event.type === 'rag_retrieved') {
+    const host = ensureAgentRagHost();
+    host.innerHTML = '';
+    const details = document.createElement('details');
+    details.className = 'agent-rag';
+    details.open = false;
+
+    const summary = document.createElement('summary');
+    const n = typeof event.chunks_count === 'number' ? event.chunks_count : 0;
+    const reason = event.reason != null ? String(event.reason) : '';
+    summary.textContent = `Documentation référencée — ${n} chunk(s) trouvé(s) (raison: ${reason})`;
+
+    const body = document.createElement('div');
+    body.className = 'agent-rag-body';
+
+    const chunks = Array.isArray(event.chunks) ? event.chunks : [];
+    if (chunks.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'agent-rag-empty';
+      empty.textContent = 'Aucun extrait injecté dans le prompt système.';
+      body.appendChild(empty);
+    } else {
+      const list = document.createElement('ul');
+      list.className = 'agent-rag-chunk-list';
+      for (const c of chunks) {
+        const li = document.createElement('li');
+        const head = document.createElement('div');
+        head.className = 'agent-rag-chunk-head';
+        const score =
+          typeof c.score === 'number' && !Number.isNaN(c.score) ? c.score.toFixed(3) : String(c.score ?? '');
+        head.textContent = `${c.source_file || '(source inconnue)'} — score ${score}`;
+        const pre = document.createElement('pre');
+        pre.className = 'agent-rag-chunk-preview';
+        pre.textContent = c.text_preview || '';
+        li.appendChild(head);
+        li.appendChild(pre);
+        list.appendChild(li);
+      }
+      body.appendChild(list);
+    }
+
+    details.appendChild(summary);
+    details.appendChild(body);
+    host.appendChild(details);
+    agentStatus.textContent = 'Documentation récupérée, génération...';
+    return;
+  }
+
   if (event.type === 'iteration_start') {
     iterationState.set(event.n, createIterationNode(event.n));
     agentStatus.textContent = `Itération ${event.n} démarrée`;
@@ -211,6 +294,7 @@ agentGenerateBtn.addEventListener('click', async () => {
   iterationState = new Map();
   finalCode = '';
   agentIterations.innerHTML = '';
+  clearAgentRagHost();
   agentLoadCodeBtn.disabled = true;
   setAgentBusy(true);
   agentStatus.textContent = 'Connexion à l’agent...';

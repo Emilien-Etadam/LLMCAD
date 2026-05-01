@@ -295,6 +295,101 @@ body, html {
   color: var(--text-bright);
 }
 
+.agent-rag-host {
+  margin: 8px 0 6px;
+  min-height: 0;
+}
+
+.agent-rag-spinner-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text);
+  background: rgba(74, 158, 255, 0.08);
+  border: 1px solid rgba(74, 158, 255, 0.45);
+  border-radius: 4px;
+}
+
+.agent-rag-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(74, 158, 255, 0.35);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: agent-rag-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes agent-rag-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.agent-rag-spinner-label {
+  line-height: 1.3;
+}
+
+.agent-rag {
+  margin: 0 0 8px;
+  padding: 8px;
+  background: rgba(74, 158, 255, 0.06);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
+.agent-rag summary {
+  cursor: pointer;
+  user-select: none;
+  color: var(--text);
+  opacity: 0.9;
+}
+
+.agent-rag summary:hover {
+  opacity: 1;
+  color: var(--text-bright);
+}
+
+.agent-rag-body {
+  margin-top: 8px;
+}
+
+.agent-rag-empty {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text);
+  opacity: 0.85;
+}
+
+.agent-rag-chunk-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 11px;
+}
+
+.agent-rag-chunk-head {
+  font-weight: 600;
+  color: var(--text-bright);
+  margin-bottom: 4px;
+}
+
+.agent-rag-chunk-preview {
+  margin: 0 0 10px 0;
+  padding: 6px;
+  background: #1c1c1c;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: Arial, sans-serif;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text);
+}
+
 .thinking-content {
   margin: 8px 0 0;
   max-height: 400px;
