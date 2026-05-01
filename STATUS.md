@@ -1,7 +1,8 @@
 # STATUS
 
 Index :
-- [Phase 8b — RAG infrastructure (ingestion Build123d)](#phase-8b--rag-infrastructure-ingestion-build123d) ← le plus récent
+- [Phase 9.0 — RAG baseline dans CADAgent](#phase-90--rag-baseline-dans-cadagent) ← le plus récent
+- [Phase 8b — RAG infrastructure (ingestion Build123d)](#phase-8b--rag-infrastructure-ingestion-build123d)
 - [Phase 8a — Streaming reasoning Qwen3](#phase-8a--streaming-reasoning-qwen3)
 - [Phase 7 — Agent loop SSE + nettoyage legacy](#phase-7--agent-loop-sse--nettoyage-legacy)
 - [Phase 6 — Worker pool persistant](#phase-6--worker-pool-persistant) ← le plus récent
@@ -11,6 +12,52 @@ Index :
 - Phase 3.5 — Sandbox extension (functions/loops/comprehensions)
 - Phase 2 — Génération CadQuery par LLM (vLLM)
 - Phase 1 — Migration Docker → Bare metal
+
+---
+
+# Phase 9.0 — RAG baseline dans CADAgent
+
+Date : 2026-05-01  
+Tag : `v0.9.0-rag-baseline` (à poser après validation sur l’environnement avec Qdrant + TEI actifs)
+
+## Résumé
+
+**Retrieval côté Node** dans `CADAgent` : avant la boucle d’itérations, embedding du prompt via **`POST {TEI_URL}/embed`** (corps `inputs: [text]`, normalisation JSON alignée sur `rag/ingest.py`), recherche **`POST {QDRANT_URL}/collections/{name}/points/search`** (`limit` = `RAG_TOP_K`, `with_payload: true`). Les chunks dont le score est **≥ `RAG_SCORE_THRESHOLD`** (défaut **0.40**) sont concaténés dans le **system prompt initial** uniquement ; les tours de correction d’erreur réutilisent le même message `system` sans nouveau retrieval.
+
+Événements SSE ajoutés : **`rag_start`**, **`rag_retrieved`** (`chunks_count`, `reason`, `chunks[]` avec `source_file`, `score`, `text_preview`). Si TEI ou Qdrant est indisponible, **`reason: error`** et l’agent continue sans contexte RAG (`console.warn`). **`RAG_ENABLED=false`** → **`reason: disabled`**.
+
+## Variables d’environnement
+
+Voir `.env.example` : `QDRANT_URL`, `QDRANT_COLLECTION`, `TEI_URL`, `RAG_TOP_K`, `RAG_SCORE_THRESHOLD`, `RAG_ENABLED`.
+
+## UI
+
+`web/js/agent.js` : spinner pendant `rag_start`, bloc dépliable « Documentation référencée » (fermé par défaut) après `rag_retrieved`. Styles `web/main.css` (`.agent-rag*`, bordure/teinte bleue).
+
+## Mesures baseline (chunking naïf — à compléter sur 5–10 prompts réels)
+
+À rejouer sur le LXC avec index à jour : noter pour chaque prompt le **succès / échec**, le **nombre d’itérations**, le **temps total**, et en cas de RAG actif les **scores max / moyens** des chunks injectés. Comparer **A/B** `RAG_ENABLED=true` vs `false` sur les mêmes prompts.
+
+| # | Prompt (résumé) | RAG | Itérations | Temps (s) | Retrieval (scores / raison) | Issue |
+|---|-----------------|-----|------------|-----------|-----------------------------|-------|
+| 1 | *ex. boîte 10×10×10* | on/off | *à mesurer* | *à mesurer* | *à mesurer* | |
+| 2 | *ex. anneau demi-rond, section 3 mm, Ø int. 15 mm* | on/off | *à mesurer* | *à mesurer* | *à mesurer* | |
+| 3 | *ex. haïku (hors sujet)* | on | *à mesurer* | *à mesurer* | `no_relevant_chunks` attendu | |
+| 4–10 | *étendre la grille* | … | … | … | … | |
+
+**Non mesurés automatiquement dans ce dépôt** : dépendance aux services distants ; remplir le tableau après campagne manuelle ou instrumentée.
+
+## Vérifications rapides (checklist)
+
+1. Prompt CAO simple → `rag_retrieved` avec `chunks_count >= 1` si seuil OK et index peuplé.  
+2. Prompt hors solide → souvent `chunks_count = 0`, `reason = no_relevant_chunks`.  
+3. Qdrant ou TEI arrêtés → `reason = error`, pas de crash Node.  
+4. `RAG_ENABLED=false` → `reason = disabled`.  
+5. Régression phase 7 / 8a : streaming reasoning + boucle d’erreur inchangés dans la boucle LLM.
+
+## Hors scope (phases suivantes)
+
+Re-retrieval sur erreur, chunking sémantique, traduction FR→EN, hybrid dense+sparse, reranker — inchangé vs roadmap utilisateur.
 
 ---
 
