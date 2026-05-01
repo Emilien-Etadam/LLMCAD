@@ -157,12 +157,12 @@ ensure_template_available_or_adapt() {
   template_storage="$(template_storage_from_ref "$requested")"
   selected="$(latest_debian13_template_from_local || true)"
   if [[ -n "$selected" ]]; then
-    log "Requested template not found. Using latest local Debian 13 template: $selected"
+    log "Requested template not found. Using latest local Debian 13 template: $selected" >&2
     echo "${template_storage}:vztmpl/${selected}"
     return 0
   fi
 
-  log "No local Debian 13 template found. Refreshing appliance index..."
+  log "No local Debian 13 template found. Refreshing appliance index..." >&2
   pveam update
   selected="$(latest_debian13_template_from_available || true)"
   if [[ -z "$selected" ]]; then
@@ -170,7 +170,7 @@ ensure_template_available_or_adapt() {
     die "No Debian 13 template found in 'pveam available'."
   fi
 
-  log "Downloading latest Debian 13 template to storage '${template_storage}': $selected"
+  log "Downloading latest Debian 13 template to storage '${template_storage}': $selected" >&2
   pveam download "$template_storage" "$selected"
   echo "${template_storage}:vztmpl/${selected}"
 }
