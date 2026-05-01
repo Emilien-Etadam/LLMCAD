@@ -148,9 +148,10 @@ latest_debian13_template_from_available() {
 ensure_template_available_or_adapt() {
   local requested="$1"
   local template_storage selected
+  RESOLVED_CT_TEMPLATE=""
 
   if template_available "$requested"; then
-    echo "$requested"
+    RESOLVED_CT_TEMPLATE="$requested"
     return 0
   fi
 
@@ -158,7 +159,7 @@ ensure_template_available_or_adapt() {
   selected="$(latest_debian13_template_from_local || true)"
   if [[ -n "$selected" ]]; then
     log "Requested template not found. Using latest local Debian 13 template: $selected" >&2
-    echo "${template_storage}:vztmpl/${selected}"
+    RESOLVED_CT_TEMPLATE="${template_storage}:vztmpl/${selected}"
     return 0
   fi
 
@@ -172,7 +173,7 @@ ensure_template_available_or_adapt() {
 
   log "Downloading latest Debian 13 template to storage '${template_storage}': $selected" >&2
   pveam download "$template_storage" "$selected"
-  echo "${template_storage}:vztmpl/${selected}"
+  RESOLVED_CT_TEMPLATE="${template_storage}:vztmpl/${selected}"
 }
 
 ct_exists() {
@@ -290,7 +291,8 @@ main() {
     die "Storage '${CT_STORAGE}' is missing or not available. Check 'pvesm status'."
   fi
 
-  CT_TEMPLATE="$(ensure_template_available_or_adapt "$CT_TEMPLATE")"
+  ensure_template_available_or_adapt "$CT_TEMPLATE"
+  CT_TEMPLATE="$RESOLVED_CT_TEMPLATE"
   log "Template selected: $CT_TEMPLATE"
 
   if ct_exists "$CT_ID"; then
