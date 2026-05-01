@@ -103,6 +103,29 @@ template_available() {
   return 1
 }
 
+list_available_debian13_templates() {
+  # Show known Debian 13 templates from local cache/index when available.
+  local lines=""
+  lines="$(
+    {
+      pveam list local 2>/dev/null || true
+      pveam available 2>/dev/null || true
+    } | grep -Eo 'debian-13-standard_[^[:space:]]+_amd64\.tar\.zst' | sort -u
+  )"
+
+  if [[ -n "$lines" ]]; then
+    log "Detected Debian 13 templates:"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && log "  - $line"
+    done <<<"$lines"
+  else
+    log "Could not enumerate Debian 13 templates via pveam."
+    log "Try manually:"
+    log "  pveam update"
+    log "  pveam available | grep debian-13-standard"
+  fi
+}
+
 ct_exists() {
   pct config "$1" &>/dev/null
 }
@@ -221,7 +244,9 @@ main() {
   if ! template_available "$CT_TEMPLATE"; then
     log "Template '${CT_TEMPLATE}' not found. Download it first, for example:"
     log "  pveam update"
+    log "  pveam available | grep debian-13-standard"
     log "  pveam download local debian-13-standard_13.1-1_amd64.tar.zst"
+    list_available_debian13_templates
     die "Aborting because the container template is missing."
   fi
 

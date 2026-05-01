@@ -11,6 +11,7 @@ Ce dossier contient un script exécutable **sur un nœud Proxmox VE** pour crée
 
   ```bash
   pveam update
+  pveam available | grep debian-13-standard
   pveam download local debian-13-standard_13.1-1_amd64.tar.zst
   ```
 
