@@ -194,7 +194,7 @@ def main() -> None:
     t0 = time.perf_counter()
     check_services()
 
-    client = QdrantClient(url=QDRANT_URL.rstrip("/"))
+    client = QdrantClient(url=QDRANT_URL.rstrip("/"), timeout=120)
     recreate_collection(client)
 
     files = discover_files(DOCS_PATH)
