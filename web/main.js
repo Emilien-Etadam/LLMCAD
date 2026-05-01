@@ -116,7 +116,7 @@ export async function runPreview() {
       }
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.Float32BufferAttribute(data.data.vertices, 3));
-      geometry.setIndex(data.data.faces);
+      geometry.setIndex(data.data.faces.flat());
       geometry.computeVertexNormals();
       const material = new THREE.MeshStandardMaterial(getMaterialProperties());
       currentModel = new THREE.Mesh(geometry, material);
