@@ -184,6 +184,7 @@ class CADAgent {
       yield { type: 'iteration_start', n };
 
       let fullResponse = '';
+      let fullReasoning = '';
       let usage = null;
       const stream = await this.client.chat.completions.create({
         model: this.model,
@@ -191,15 +192,28 @@ class CADAgent {
         stream: true,
         stream_options: { include_usage: true },
         temperature: 0.2,
-        max_tokens: 1024
+        max_tokens: 4096
       });
 
       for await (const chunk of stream) {
-        const token = chunk.choices[0]?.delta?.content || '';
-        if (token) {
-          fullResponse += token;
-          yield { type: 'llm_token', token };
+        const delta = chunk.choices[0]?.delta;
+        if (!delta) {
+          if (chunk.usage) usage = chunk.usage;
+          continue;
         }
+
+        const reasoningToken = delta.reasoning || '';
+        if (reasoningToken) {
+          fullReasoning += reasoningToken;
+          yield { type: 'reasoning_token', token: reasoningToken };
+        }
+
+        const contentToken = delta.content || '';
+        if (contentToken) {
+          fullResponse += contentToken;
+          yield { type: 'llm_token', token: contentToken };
+        }
+
         if (chunk.usage) usage = chunk.usage;
       }
 
@@ -207,6 +221,9 @@ class CADAgent {
         totalPromptTokens += usage.prompt_tokens || 0;
         totalCompletionTokens += usage.completion_tokens || 0;
       }
+      console.log(
+        `[agent] iter=${n} reasoning_chars=${fullReasoning.length} content_chars=${fullResponse.length}`
+      );
       console.log(
         `[agent] iter=${n} tokens prompt=${usage?.prompt_tokens ?? 0} completion=${usage?.completion_tokens ?? 0} total_prompt=${totalPromptTokens} total_completion=${totalCompletionTokens} grand_total=${totalPromptTokens + totalCompletionTokens}`
       );

@@ -274,6 +274,41 @@ body, html {
   border-top: 1px solid var(--border);
 }
 
+.agent-thinking {
+  margin: 0 0 8px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border-left: 3px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
+.agent-thinking summary {
+  cursor: pointer;
+  user-select: none;
+  color: var(--text);
+  opacity: 0.85;
+}
+
+.agent-thinking summary:hover {
+  opacity: 1;
+  color: var(--text-bright);
+}
+
+.thinking-content {
+  margin: 8px 0 0;
+  max-height: 400px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-style: italic;
+  color: var(--text);
+  opacity: 0.88;
+  font-family: Arial, sans-serif;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .agent-code {
   margin: 0;
   font-family: 'Courier New', Courier, monospace;

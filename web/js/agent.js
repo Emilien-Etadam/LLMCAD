@@ -19,6 +19,33 @@ function setAgentBusy(busy) {
   }
 }
 
+function ensureThinkingSection(entry) {
+  if (entry.thinkingPre) return;
+  const thinkingDetails = document.createElement('details');
+  thinkingDetails.className = 'agent-thinking';
+  thinkingDetails.open = true;
+
+  const thinkingSummary = document.createElement('summary');
+  thinkingSummary.textContent = 'Réflexion du modèle';
+
+  const thinkingPre = document.createElement('pre');
+  thinkingPre.className = 'thinking-content';
+  thinkingPre.textContent = '';
+
+  thinkingDetails.appendChild(thinkingSummary);
+  thinkingDetails.appendChild(thinkingPre);
+  entry.body.insertBefore(thinkingDetails, entry.code);
+
+  entry.thinkingDetails = thinkingDetails;
+  entry.thinkingPre = thinkingPre;
+  entry.thinkingKeptOpenByUser = false;
+
+  thinkingDetails.addEventListener('toggle', () => {
+    if (entry.thinkingToggleFromProgram) return;
+    entry.thinkingKeptOpenByUser = thinkingDetails.open;
+  });
+}
+
 function createIterationNode(n) {
   const details = document.createElement('details');
   details.className = 'agent-iteration';
@@ -44,7 +71,17 @@ function createIterationNode(n) {
   details.appendChild(summary);
   details.appendChild(body);
   agentIterations.prepend(details);
-  return { details, summary, code, error };
+  return {
+    details,
+    summary,
+    body,
+    code,
+    error,
+    thinkingDetails: null,
+    thinkingPre: null,
+    thinkingKeptOpenByUser: false,
+    thinkingToggleFromProgram: false
+  };
 }
 
 function updateIterationStatus(n, status) {
@@ -68,7 +105,22 @@ function applyAgentEvent(event) {
     return;
   }
 
+  if (event.type === 'reasoning_token' && current) {
+    agentStatus.textContent = `Réflexion du modèle (itération ${currentN})...`;
+    ensureThinkingSection(current);
+    current.thinkingPre.textContent += event.token || '';
+    if (current.thinkingDetails && current.thinkingDetails.open) {
+      current.thinkingPre.scrollTop = current.thinkingPre.scrollHeight;
+    }
+    return;
+  }
+
   if (event.type === 'code_extracted' && current) {
+    if (current.thinkingDetails && !current.thinkingKeptOpenByUser) {
+      current.thinkingToggleFromProgram = true;
+      current.thinkingDetails.open = false;
+      current.thinkingToggleFromProgram = false;
+    }
     current.code.textContent = event.code || '';
     updateIterationStatus(currentN, 'code extrait');
     return;

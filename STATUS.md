@@ -1,7 +1,8 @@
 # STATUS
 
 Index :
-- [Phase 7 — Agent loop SSE + nettoyage legacy](#phase-7--agent-loop-sse--nettoyage-legacy) ← le plus récent
+- [Phase 8a — Streaming reasoning Qwen3](#phase-8a--streaming-reasoning-qwen3) ← le plus récent
+- [Phase 7 — Agent loop SSE + nettoyage legacy](#phase-7--agent-loop-sse--nettoyage-legacy)
 - [Phase 6 — Worker pool persistant](#phase-6--worker-pool-persistant) ← le plus récent
 - [Phase 5 — Migration Build123d](#phase-5--migration-cadquery--build123d)
 - Phase 4.5 — Isolation subprocess + Assembly support
@@ -9,6 +10,25 @@ Index :
 - Phase 3.5 — Sandbox extension (functions/loops/comprehensions)
 - Phase 2 — Génération CadQuery par LLM (vLLM)
 - Phase 1 — Migration Docker → Bare metal
+
+---
+
+# Phase 8a — Streaming reasoning Qwen3
+
+Date : 2026-05-01  
+Tag : `v0.8.1-reasoning-stream`
+
+## Résumé
+
+Avec vLLM et `--reasoning-parser qwen3`, le chain-of-thought est exposé dans `delta.reasoning_content` du stream OpenAI-compatible. `CADAgent` émet désormais des événements SSE **`reasoning_token`** (nouveau, uniquement additionnel) en parallèle de **`llm_token`**. Le thinking n’est ni passé à `extractPythonCode()`, ni ajouté à `messages`. L’UI Agent affiche une section dépliable « Réflexion du modèle » alimentée au fil de l’eau ; sans reasoning côté serveur, aucune section n’apparaît (comportement inchangé pour les autres modèles).
+
+Logs Node : ligne `[agent] iter=N reasoning_chars=… content_chars=…` pour le ratio thinking / contenu final.
+
+## Vérifications phase 8a
+
+- Prompt simple / complexe : texte visible dans « Réflexion du modèle » avant le code lorsque le parser reasoning est actif.
+- Code extrait et historique `messages` : uniquement `fullResponse` (content), pas le reasoning.
+- Absence de `reasoning_content` : pas de régression, pas de bloc thinking vide.
 
 ---
 
