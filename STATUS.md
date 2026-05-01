@@ -1,7 +1,8 @@
 # STATUS
 
 Index :
-- [Phase 8a — Streaming reasoning Qwen3](#phase-8a--streaming-reasoning-qwen3) ← le plus récent
+- [Phase 8b — RAG infrastructure (ingestion Build123d)](#phase-8b--rag-infrastructure-ingestion-build123d) ← le plus récent
+- [Phase 8a — Streaming reasoning Qwen3](#phase-8a--streaming-reasoning-qwen3)
 - [Phase 7 — Agent loop SSE + nettoyage legacy](#phase-7--agent-loop-sse--nettoyage-legacy)
 - [Phase 6 — Worker pool persistant](#phase-6--worker-pool-persistant) ← le plus récent
 - [Phase 5 — Migration Build123d](#phase-5--migration-cadquery--build123d)
@@ -10,6 +11,29 @@ Index :
 - Phase 3.5 — Sandbox extension (functions/loops/comprehensions)
 - Phase 2 — Génération CadQuery par LLM (vLLM)
 - Phase 1 — Migration Docker → Bare metal
+
+---
+
+# Phase 8b — RAG infrastructure (ingestion Build123d)
+
+Date : 2026-05-01  
+Commit : `feat(rag): add ingestion pipeline for build123d docs` (pas de tag release)
+
+## Résumé
+
+Ajout du dossier `rag/` : script **`ingest.py`** qui vérifie **Qdrant** (`/healthz`) et **TEI** (`/health`), supprime/recrée une collection (**1024** dims, distance **COSINE**), découvre récursivement les `*.rst` et `*.py` sous la doc Build123d, découpe par **tiktoken** (`cl100k_base`, fenêtre 500 / chevauchement 50 par défaut), envoie les embeddings par batch à **`POST {TEI_URL}/embed`**, puis **upsert** dans Qdrant par paquets de 64 avec UUID hex et payload incluant le **texte** du chunk pour réinjection LLM (phase 9). **`search_test.py`** : cinq requêtes françaises, recherche top‑5, affichage score / fichier / extrait.
+
+Dépendances isolées : `rag/requirements.txt` (`qdrant-client`, `requests`, `tiktoken`). Procédure : `rag/README.md`.
+
+## Limites / hors scope
+
+Chunking token uniquement (pas de RST sémantique) ; ré-ingestion **destructive** sur la collection cible ; pas d’intégration CADAgent ni reranker (phase 9).
+
+## Vérifications recommandées
+
+- Services down avant ingest → exit **1**, aucune écriture Qdrant.
+- `python rag/ingest.py` puis `curl …/collections/build123d_docs` → `points_count` cohérent ; double run → même ordre de grandeur.
+- `python rag/search_test.py` → résultats plausiblement liés aux requêtes.
 
 ---
 
